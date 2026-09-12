@@ -1,0 +1,10 @@
+{
+  "luci-app-blockwatch": {
+    "description": "Blockwatch: просмотр находок наблюдателя за блокировками",
+    "read": {
+      "file": {
+        "/usr/bin/blockwatch": [ "exec" ]
+      }
+    }
+  }
+}

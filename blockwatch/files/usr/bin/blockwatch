@@ -1,0 +1,914 @@
+#!/bin/sh
+# blockwatch — наблюдатель за блокировками для OpenWrt с netshift или podkop.
+#
+# Находит сайты, которые у провайдера не открываются напрямую, но открываются
+# через туннель, проверяет каждый опытом и подтверждённые дописывает в свой
+# файл доменов. Файл подключается в netshift/podkop как Local Domain List, а
+# sing-box перечитывает его сам, на лету — соединения при этом не рвутся.
+#
+# Чего blockwatch не делает: не меняет маршруты и настройки sing-box, zapret и
+# netshift/podkop (кроме явной команды `hook`), не пишет в их nft-таблицы и сам
+# их не перезапускает. Единственная точка связи с ними — файл доменов.
+#
+# Как находит. Своя nft-таблица только считает признаки (ни одного вердикта):
+#   сброс      — RST на 80/443 сразу после приветствия TLS;
+#   нет-ответа — SYN уходит, SYN-ACK не приходит;
+#   молчит     — наши пакеты с данными уходят, обратно ни одного;
+#   обрыв      — передача началась и замерла, а мы продолжаем переспрашивать;
+#   обход      — медленный обход имён, которые в доме уже открывали.
+# Смотрит только трафик мимо туннеля — то, что ушло в туннель, уже не наше дело.
+#
+# Как проверяет. Подозрение не равно блокировке. Кандидат проверяется curl:
+# сайт целиком напрямую, этот адрес напрямую и он же через туннель (socks-вход
+# sing-box). Заблокирован — только если напрямую не отвечают ни сайт, ни адрес,
+# а через туннель ответ приходит целиком. Оборванная на середине передача — это
+# отказ, даже если заголовки успели прийти с кодом 200. Подтверждённой
+# находка становится после двух совпадений в разных проверках.
+#
+# https://github.com/xDarkOne/blockwatch — GPL-2.0
+
+VERSION=0.1.0
+CONFIG=blockwatch
+DIR=/tmp/blockwatch                     # рабочее состояние: ОЗУ, флеш не трогаем
+STATE_DIR=/etc/blockwatch               # на флеш — только находки и настройки
+LOG=$STATE_DIR/blockwatch.log
+STATE=$STATE_DIR/verdicts
+SAVED=$STATE_DIR/saved-settings         # что было в системе до установки
+NFT_FILE=$DIR/rules.nft
+NFT_VERSION=v3                          # менять при правке правил nft
+
+TICK=15            # шаг наблюдения, секунд
+WINDOW=100         # длительность захода: cron запускает его раз в 2 минуты
+MAX_TICK=2         # проверок за шаг
+MAX_RUN=10         # проверок за заход
+RECHECK=21600      # как часто перепроверять уже решённое, секунд
+MIN_RST=3          # сбросов до кандидата
+MIN_SYN=4          # неотвеченных SYN до кандидата
+MIN_DATA=2         # пакетов с данными без ответа до кандидата
+MIN_SILENT=3       # шагов «тишины» до кандидата
+MAX_EXPORT=20      # доменов за один перенос
+
+mkdir -p "$DIR"
+now=$(date +%s)
+
+cfg() { _v=$(uci -q get "$CONFIG.main.$1"); echo "${_v:-$2}"; }
+
+DOMAINS_FILE=$(cfg domains_file /etc/blockwatch/domains.txt)
+AUTO_EXPORT=$(cfg auto_export 1)
+MAX_DAY=$(cfg max_per_day 30)
+
+# --- бэкенд: netshift, podkop или совместимый -------------------------------
+# Всё, что отличает их друг от друга, берём из их же constants.sh, а не
+# прописываем: имена nft-таблиц, метки, адреса DNS и каталог наборов.
+detect_backend() {
+    BACKEND=$(cfg backend auto)
+    if [ "$BACKEND" = auto ]; then
+        BACKEND=""
+        for _b in netshift podkop; do
+            if [ -x "/usr/bin/$_b" ] && [ -f "/etc/config/$_b" ]; then
+                BACKEND=$_b
+                break
+            fi
+        done
+    fi
+    CONST=/usr/lib/$BACKEND/constants.sh
+
+    NFT_TABLE=$(cfg nft_table "$(const NFT_TABLE_NAME '')")
+    NFT_SET=$(cfg nft_set "$(const NFT_COMMON_SET_NAME '')")
+    MARK=$(cfg fakeip_mark "$(const NFT_FAKEIP_MARK 0x00100000)")
+    DNS=$(cfg dns "$(const SB_DNS_INBOUND_ADDRESS 127.0.0.42)")
+    FAKEIP_RANGE=$(cfg fakeip_range "$(const SB_FAKEIP_INET4_RANGE 198.18.0.0/15)")
+    FAKEIP_TEST=$(const FAKEIP_TEST_DOMAIN fakeip.podkop.fyi)
+    _sbdir=$(const TMP_SING_BOX_FOLDER /tmp/sing-box)
+    RULESET_DIR=$(const TMP_RULESET_FOLDER "$_sbdir/rulesets" |
+                  sed "s|\$TMP_SING_BOX_FOLDER|$_sbdir|")
+    SB_CONFIG=""
+    [ -n "$BACKEND" ] && SB_CONFIG=$(uci -q get "$BACKEND.settings.config_path")
+    SB_CONFIG=${SB_CONFIG:-/etc/sing-box/config.json}
+}
+
+const() {   # имя, значение по умолчанию
+    _v=""
+    [ -n "$BACKEND" ] && [ -f "$CONST" ] &&
+        _v=$(sed -n "s/^$1=//p" "$CONST" | head -1 | tr -d "\"'")
+    echo "${_v:-$2}"
+}
+
+detect_backend
+
+# --- адреса и имена -----------------------------------------------------------
+dns_a() {   # имя [сервер] -> последний IPv4 из ответа
+    nslookup "$1" "${2:-$DNS}" 2>/dev/null |
+        awk '/^Address/ { v = $NF; if (v ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print v }' |
+        tail -1
+}
+
+in_range() {   # адрес, сеть/маска
+    awk -v ip="$1" -v net="$2" '
+        function num(a,  p) { split(a, p, "."); return ((p[1] * 256 + p[2]) * 256 + p[3]) * 256 + p[4] }
+        BEGIN {
+            if (ip !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) exit 1
+            split(net, x, "/"); size = 2 ^ (32 - (x[2] == "" ? 32 : x[2]))
+            exit !(int(num(ip) / size) == int(num(x[1]) / size))
+        }'
+}
+
+# Домен уже в каком-то списке бэкенда? Тогда его DNS выдаёт подменный адрес
+# (fakeip) — неважно, в туннель он направлен или в исключения.
+via_backend() { _a=$(dns_a "$1"); [ -n "$_a" ] && in_range "$_a" "$FAKEIP_RANGE"; }
+
+# Адреса серверов из конфига sing-box: их трафик не считаем, их имена никогда
+# не добавляем — иначе туннель замкнулся бы сам на себя.
+proxy_servers() {
+    [ -f "$SB_CONFIG" ] &&
+        jq -r '.outbounds[]? | .server // empty' "$SB_CONFIG" 2>/dev/null | sort -u
+}
+
+# Стоп-список: суффиксы из настроек плюс имена своих серверов.
+build_never() {
+    _list=$(uci -q get "$CONFIG.main.never_suffix")
+    [ -n "$_list" ] || _list="ru su xn--p1ai googlevideo.com gvt1.com"
+    for _h in $(proxy_servers); do
+        case "$_h" in
+            *[!0-9.]*) _list="$_list $_h $(echo "$_h" | awk -F. 'NF >= 2 { print $(NF-1) "." $NF }')" ;;
+        esac
+    done
+    NEVER=""
+    for _s in $_list; do
+        _e=$(printf '%s' "$_s" | sed 's/\./\\./g')
+        NEVER="${NEVER:+$NEVER|}(^|\\.)$_e\$"
+    done
+}
+
+# --- socks-вход sing-box, через который проверяется «работает ли в туннеле» ---
+# У netshift и podkop служебный вход service-mixed-in есть только при включённой
+# загрузке списков через прокси, поэтому ищем любой mixed/socks-вход, а потом
+# убеждаемся делом, что через него выход действительно другой.
+detect_socks() {
+    SOCKS=$(cfg socks "")
+    [ -n "$SOCKS" ] && return 0
+    [ -f "$SB_CONFIG" ] || return 1
+    # shellcheck disable=SC2046  # ответ jq — два слова, разбиение нужно
+    set -- $(jq -r '
+        [.inbounds[]? | select((.type == "mixed" or .type == "socks")
+                               and .listen != null and .listen_port != null)] as $in
+        | (($in | map(select(.tag == "service-mixed-in"))) + $in) | first
+        | if . then "\(.listen) \(.listen_port)" else empty end' "$SB_CONFIG" 2>/dev/null)
+    [ -n "$2" ] || return 1
+    case "$1" in
+        0.0.0.0|::|"") SOCKS="127.0.0.1:$2" ;;
+        *:*)           SOCKS="[$1]:$2" ;;
+        *)             SOCKS="$1:$2" ;;
+    esac
+}
+
+exit_ip() {   # [socks] -> внешний адрес
+    for _u in https://ifconfig.me/ip https://api.ipify.org https://icanhazip.com; do
+        if [ -n "$1" ]; then
+            _ip=$(curl -4 -s -m 8 -x "socks5h://$1" "$_u" 2>/dev/null | tr -d ' \r\n')
+        else
+            _ip=$(curl -4 -s -m 8 "$_u" 2>/dev/null | tr -d ' \r\n')
+        fi
+        case "$_ip" in *.*.*.*) echo "$_ip"; return 0 ;; esac
+    done
+    return 1
+}
+
+# Кэш на час в $DIR/tunnel: «время годен прямой_адрес адрес_через_туннель».
+# status читает только кэш — сеть трогает заход или doctor.
+tunnel_check() {   # [force]
+    if [ "$1" != force ] && [ -f "$DIR/tunnel" ]; then
+        read -r _ts _ok _d _t < "$DIR/tunnel"
+        [ $((now - ${_ts:-0})) -lt 3600 ] && { [ "$_ok" = 1 ]; return; }
+    fi
+    _ok=0; _d=""; _t=""
+    if detect_socks; then
+        _d=$(exit_ip)
+        _t=$(exit_ip "$SOCKS")
+        [ -n "$_t" ] && [ "$_t" != "$_d" ] && _ok=1
+    fi
+    echo "$now $_ok ${_d:--} ${_t:--} ${SOCKS:--}" > "$DIR/tunnel"
+    [ "$_ok" = 1 ]
+}
+
+# --- nft: только счётчики ----------------------------------------------------
+wan_devs() {
+    ip -4 route show default 2>/dev/null |
+        awk '{ for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1) }' | sort -u
+}
+
+write_nft() {
+    _names=""
+    for _w in $1; do _names="${_names:+$_names, }\"$_w\""; done
+    cat > "$NFT_FILE" <<NFTEOF
+# blockwatch-$NFT_VERSION wan: $1
+# Только счётчики: все цепочки policy accept, вердиктов нет. Таблица своя,
+# чужие таблицы (fw4, zapret, netshift, podkop) не затрагиваются.
+table inet blockwatch {
+    set skip {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8,
+                     169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16,
+                     $FAKEIP_RANGE, 224.0.0.0/4, 240.0.0.0/4 }
+    }
+    set peers { type ipv4_addr; }
+    set syn_out  { type ipv4_addr; flags dynamic; timeout 1h; size 16384; }
+    set ack_in   { type ipv4_addr; flags dynamic; timeout 1h; size 16384; }
+    set rst_in   { type ipv4_addr; flags dynamic; timeout 1h; size 16384; }
+    set data_out { type ipv4_addr; flags dynamic; timeout 1h; size 16384; }
+    set data_in  { type ipv4_addr; flags dynamic; timeout 1h; size 16384; }
+
+    chain watch_out {
+        type filter hook postrouting priority -150; policy accept;
+        oifname != { $_names } return
+        meta mark & $MARK == $MARK return
+        ip daddr @skip return
+        ip daddr @peers return
+        tcp dport { 80, 443 } tcp flags & (fin|syn|rst|ack) == syn update @syn_out { ip daddr counter }
+        tcp dport { 80, 443 } tcp flags & (fin|syn|rst) == 0 meta length > 100 update @data_out { ip daddr counter }
+    }
+    chain watch_in {
+        type filter hook prerouting priority -150; policy accept;
+        iifname != { $_names } return
+        ip saddr @skip return
+        ip saddr @peers return
+        tcp sport { 80, 443 } tcp flags & (fin|syn|rst|ack) == (syn|ack) update @ack_in { ip saddr counter }
+        tcp sport { 80, 443 } tcp flags & (rst) == rst update @rst_in { ip saddr counter }
+        tcp sport { 80, 443 } tcp flags & (fin|syn|rst) == 0 meta length > 100 update @data_in { ip saddr counter }
+    }
+}
+NFTEOF
+}
+
+ensure_nft() {
+    command -v nft >/dev/null 2>&1 || return 1
+    _wans=$(wan_devs | tr '\n' ' ' | sed 's/ $//')
+    [ -n "$_wans" ] || { logger -t blockwatch "не найден выход в интернет"; return 1; }
+    # пересобираем, если сменился выход (переподключение, pppoe, mwan) или версия
+    if ! grep -qxF "# blockwatch-$NFT_VERSION wan: $_wans" "$NFT_FILE" 2>/dev/null; then
+        nft delete table inet blockwatch 2>/dev/null
+        write_nft "$_wans"
+    fi
+    if ! nft list table inet blockwatch >/dev/null 2>&1; then
+        nft -f "$NFT_FILE" || return 1
+        logger -t blockwatch "счётчики подняты на: $_wans"
+    fi
+    for _h in $(proxy_servers); do
+        case "$_h" in
+            *[!0-9.]*) _a=$(dns_a "$_h" 127.0.0.1)
+                       in_range "$_a" "$FAKEIP_RANGE" && _a="" ;;
+            *) _a=$_h ;;
+        esac
+        [ -n "$_a" ] && nft add element inet blockwatch peers "{ $_a }" 2>/dev/null
+    done
+    return 0
+}
+
+set_counts() {
+    nft -j list set inet blockwatch "$1" 2>/dev/null | jq -r '
+        .nftables[]?.set?.elem[]? |
+        if type == "object" then ((.elem // .) | "\(.val) \(.counter.packets // 1)")
+        else "\(.) 1" end' 2>/dev/null
+}
+
+# --- имена сайтов из журнала запросов dnsmasq --------------------------------
+update_ipmap() {
+    logread 2>/dev/null | awk '
+        / dnsmasq\[/ {
+            for (i = 1; i <= NF; i++)
+                if (($i == "reply" || $i == "cached") && $(i+2) == "is" &&
+                    $(i+3) ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/)
+                    print $(i+3), $(i+1)
+        }' > "$DIR/ipmap.new" 2>/dev/null
+    [ -s "$DIR/ipmap.new" ] || { rm -f "$DIR/ipmap.new"; return 0; }
+    cat "$DIR/ipmap" "$DIR/ipmap.new" 2>/dev/null | awk '!seen[$0]++' |
+        tail -4000 > "$DIR/ipmap.tmp"
+    mv "$DIR/ipmap.tmp" "$DIR/ipmap"; rm -f "$DIR/ipmap.new"
+}
+
+domain_of() { grep "^$1 " "$DIR/ipmap" 2>/dev/null | tail -1 | awk '{ print $2 }'; }
+
+# --- таблица соединений -------------------------------------------------------
+silent_now() {
+    awk '
+        / tcp / {
+            dst = ""; dport = ""; np = 0; nb = 0; p1 = 0; p2 = 0; b2 = 0
+            for (i = 1; i <= NF; i++) {
+                f = $i
+                if (dst == "" && substr(f, 1, 4) == "dst=") dst = substr(f, 5)
+                else if (dport == "" && substr(f, 1, 6) == "dport=") dport = substr(f, 7)
+                if (substr(f, 1, 8) == "packets=") {
+                    np++
+                    if (np == 1) p1 = substr(f, 9) + 0; else if (np == 2) p2 = substr(f, 9) + 0
+                } else if (substr(f, 1, 6) == "bytes=") {
+                    nb++
+                    if (nb == 2) b2 = substr(f, 7) + 0
+                }
+            }
+            if (dport != "443" && dport != "80") next
+            if (p1 >= 3 && p2 >= 1 && b2 < 200) print dst
+            else if (p1 >= 3 && p2 == 0) print dst
+        }' /proc/net/nf_conntrack 2>/dev/null | sort -u
+}
+
+flows_now() {
+    awk '/ tcp / && /ESTABLISHED/ {
+        src = ""; dst = ""; sport = ""; dport = ""
+        np = 0; nb = 0; p1 = 0; b1 = 0; b2 = 0
+        for (i = 1; i <= NF; i++) {
+            f = $i
+            if (src == "" && substr(f, 1, 4) == "src=") src = substr(f, 5)
+            else if (dst == "" && substr(f, 1, 4) == "dst=") dst = substr(f, 5)
+            else if (sport == "" && substr(f, 1, 6) == "sport=") sport = substr(f, 7)
+            else if (dport == "" && substr(f, 1, 6) == "dport=") dport = substr(f, 7)
+            if (substr(f, 1, 8) == "packets=") { np++; if (np == 1) p1 = substr(f, 9) + 0 }
+            else if (substr(f, 1, 6) == "bytes=") {
+                nb++
+                if (nb == 1) b1 = substr(f, 7) + 0; else if (nb == 2) b2 = substr(f, 7) + 0
+            }
+        }
+        if (dport != "443" && dport != "80") next
+        print src ":" sport "-" dst ":" dport, dst, p1, b1, b2
+    }' /proc/net/nf_conntrack 2>/dev/null
+}
+
+# --- проверка опытом ----------------------------------------------------------
+get() {   # таймаут, url, [аргументы curl] -> код, «~» если передача оборвалась
+    _to=$1; _url=$2; shift 2
+    _c=$(curl -4 -s -o /dev/null -m "$_to" "$@" -w '%{http_code}' "$_url" 2>/dev/null)
+    if [ $? -ne 0 ]; then echo "${_c:-000}~"; else echo "${_c:-000}"; fi
+}
+
+ok() { case "$1" in 000|*~) return 1 ;; *) return 0 ;; esac; }
+
+probe() {   # адрес, [имя] -> «сайт адрес туннель»
+    _ip=$1; _dom=$2
+    if [ -n "$_dom" ]; then
+        _w=$(get 9 "https://$_dom/")
+        ok "$_w" && { echo "$_w - -"; return; }
+        _d=$(get 7 "https://$_dom/" --resolve "$_dom:443:$_ip")
+        _v=$(get 10 "https://$_dom/" --resolve "$_dom:443:$_ip" -x "socks5://$SOCKS")
+    else
+        # без имени блокировку по SNI не воспроизвести: проверяем одинаково
+        # оба пути по адресу, и вывод получается осторожным
+        _d=$(get 7 "https://$_ip/" -k)
+        _w=$_d
+        ok "$_w" && { echo "$_w $_d -"; return; }
+        _v=$(get 10 "https://$_ip/" -k -x "socks5://$SOCKS")
+    fi
+    echo "$_w $_d $_v"
+}
+
+# Живой — если напрямую ответил сайт или хотя бы сам адрес. Заблокирован —
+# только если напрямую не ответили оба, а через туннель ответ пришёл целиком.
+verdict_of() {
+    if ok "$1" || ok "$2"; then echo "живой"
+    elif ok "$3"; then echo "ЗАБЛОКИРОВАН"
+    else echo "лежит"; fi
+}
+
+same_file() { [ "$(md5sum < "$1" 2>/dev/null)" = "$(md5sum < "$2" 2>/dev/null)" ]; }
+
+# --- заход -------------------------------------------------------------------
+scan_running() {
+    [ -f "$DIR/lock" ] && kill -0 "$(cat "$DIR/lock" 2>/dev/null)" 2>/dev/null
+}
+
+scan() {
+    [ "$(cfg enabled 1)" = 1 ] || exit 0
+    scan_running && exit 0
+    echo $$ > "$DIR/lock"
+    trap 'rm -f "$DIR/lock"' EXIT INT TERM
+    touch "$DIR/ipmap" "$DIR/silent" "$DIR/verdicts" "$DIR/flows"
+    [ -s "$DIR/verdicts" ] || { [ -s "$STATE" ] && cp -f "$STATE" "$DIR/verdicts"; }
+
+    if [ -z "$BACKEND" ]; then
+        logger -t blockwatch "не найден netshift/podkop — заход пропущен"
+        exit 0
+    fi
+    ensure_nft || { logger -t blockwatch "nft-счётчики не поднялись"; exit 1; }
+    build_never
+    TUNNEL=0; tunnel_check && TUNNEL=1
+
+    checked_run=0
+    deadline=$((now + WINDOW))
+
+  while :; do
+    now=$(date +%s)
+    checked=0
+    update_ipmap
+
+    set_counts syn_out  > "$DIR/syn"
+    set_counts ack_in   > "$DIR/ack"
+    set_counts rst_in   > "$DIR/rst"
+    set_counts data_out > "$DIR/dout"
+    set_counts data_in  > "$DIR/din"
+
+    silent_now > "$DIR/silent.now"
+    awk -v now="$now" '
+        NR == FNR { if (now - $3 < 3600) { c[$1] = $2; t[$1] = $3 } ; next }
+        { c[$1] = c[$1] + 1; t[$1] = now }
+        END { for (k in c) print k, c[k], t[k] }' \
+        "$DIR/silent" "$DIR/silent.now" > "$DIR/silent.tmp" 2>/dev/null
+    mv "$DIR/silent.tmp" "$DIR/silent"
+
+    # обрыв: поток жив, байты от сервера не изменились, а наших пакетов стало
+    # больше на два и более — ждём и переспрашиваем. Бездействующее соединение
+    # так не выглядит: там молчат обе стороны.
+    flows_now > "$DIR/flows.now"
+    awk 'NR == FNR { p[$1] = $3; b[$1] = $5; next }
+         ($1 in b) && $5 == b[$1] && $5 > 0 && $4 > 200 && $3 >= p[$1] + 2 { print $2 }' \
+        "$DIR/flows" "$DIR/flows.now" 2>/dev/null | sort -u > "$DIR/stalled"
+    mv "$DIR/flows.now" "$DIR/flows"
+
+    {
+        awk '{ print $1, "обрыв" }' "$DIR/stalled"
+        awk -v m="$MIN_RST" '$2 + 0 >= m { print $1, "сброс" }' "$DIR/rst"
+        awk -v m="$MIN_SYN" 'NR == FNR { a[$1] = 1; next }
+             $2 + 0 >= m && !($1 in a) { print $1, "нет-ответа" }' "$DIR/ack" "$DIR/syn"
+        awk -v m="$MIN_DATA" 'NR == FNR { a[$1] = 1; next }
+             $2 + 0 >= m && !($1 in a) { print $1, "молчит" }' "$DIR/din" "$DIR/dout"
+        awk -v m="$MIN_SILENT" 'NR == FNR { s[$1] = 1; next }
+             ($1 in s) && $2 + 0 >= m { print $1, "тишина" }' "$DIR/syn" "$DIR/silent"
+    } 2>/dev/null | awk '{ r[$1] = (r[$1] == "" ? $2 : r[$1] "+" $2) }
+                         END { for (k in r) print k, r[k] }' > "$DIR/cand"
+
+    # без настоящего туннеля проверять нечем: только копим признаки
+    if [ "$TUNNEL" = 1 ]; then
+        while read -r ip why; do check_one "$ip" "$why" || break; done < "$DIR/cand"
+
+        # недоподтверждённое доводим до конца: к именам с вердиктом обход не
+        # возвращается, и второй проверки иначе не было бы никогда
+        awk -F'|' -v now="$now" '$3 == "ЗАБЛОКИРОВАН" && $4 + 0 < 2 && now - $6 >= 900 {
+            print $1, $7, $2 }' "$DIR/verdicts" > "$DIR/redo" 2>/dev/null
+        while read -r rip rwhy rdom; do
+            [ "$rdom" = "-" ] && rdom=""
+            check_one "$rip" "$rwhy" "$rdom" || break
+        done < "$DIR/redo"
+
+        [ "$checked" -eq 0 ] && sweep
+
+        [ "$AUTO_EXPORT" = 1 ] && export_domains auto >/dev/null 2>&1
+    fi
+
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    [ "$checked_run" -ge "$MAX_RUN" ] && break
+    sleep "$TICK"
+  done
+
+    tail -400 "$DIR/verdicts" > "$DIR/v.trim" && mv "$DIR/v.trim" "$DIR/verdicts"
+    mkdir -p "$STATE_DIR"
+    same_file "$DIR/verdicts" "$STATE" || cp -f "$DIR/verdicts" "$STATE"
+}
+
+check_one() {   # адрес, признак, [имя]
+    ip=$1; why=$2; dom=$3
+    [ -n "$ip" ] || return 0
+    [ "$checked" -ge "$MAX_TICK" ] && return 1
+    [ "$checked_run" -ge "$MAX_RUN" ] && return 1
+
+    old=$(grep "^$ip|" "$DIR/verdicts" 2>/dev/null | tail -1)
+    if [ -n "$old" ]; then
+        last=$(echo "$old" | cut -d'|' -f6)
+        wait=$RECHECK
+        if [ "$(echo "$old" | cut -d'|' -f3)" = "ЗАБЛОКИРОВАН" ] &&
+           [ "$(echo "$old" | cut -d'|' -f4)" -lt 2 ]; then wait=900; fi
+        [ $((now - last)) -lt "$wait" ] && return 0
+    fi
+
+    [ -n "$dom" ] || dom=$(domain_of "$ip")
+    # shellcheck disable=SC2046  # probe печатает три кода через пробел
+    set -- $(probe "$ip" "$dom")
+    v=$(verdict_of "$1" "$2" "$3")
+    codes="$1/$2/$3"
+    checked=$((checked + 1)); checked_run=$((checked_run + 1))
+
+    hits=$(echo "$old" | cut -d'|' -f4); [ -n "$hits" ] || hits=0
+    first=$(echo "$old" | cut -d'|' -f5); [ -n "$first" ] || first=$now
+    if [ "$v" = "ЗАБЛОКИРОВАН" ]; then hits=$((hits + 1)); else hits=0; fi
+
+    grep -v "^$ip|" "$DIR/verdicts" 2>/dev/null > "$DIR/v.tmp"
+    echo "$ip|${dom:--}|$v|$hits|$first|$now|$why|$codes" >> "$DIR/v.tmp"
+    mv "$DIR/v.tmp" "$DIR/verdicts"
+
+    if [ "$v" = "ЗАБЛОКИРОВАН" ] && [ "$hits" -eq 2 ]; then
+        mkdir -p "$STATE_DIR"
+        echo "$(date '+%Y-%m-%d %H:%M') ПОДТВЕРЖДЕНО $ip ${dom:-без-имени} признак=$why коды=$codes" >> "$LOG"
+        logger -t blockwatch "подтверждена блокировка $ip ${dom:-без-имени}"
+    fi
+    return 0
+}
+
+# Всё — одним awk. Проверка диапазона отдельным процессом на каждую строку
+# означала бы тысячи процессов за шаг раз в 15 секунд: так и вышло в первой
+# общей версии, нагрузка роутера доходила до 8.
+# FILENAME, а не NR==FNR: при пустом файле вердиктов NR==FNR принял бы
+# строки карты имён за вердикты, и обход не нашёл бы ничего.
+sweep_filter() {   # файл «адрес имя» -> кандидаты для обхода
+    awk -v vfile="$DIR/verdicts" -v net="$FAKEIP_RANGE" '
+        function num(a,  p) { split(a, p, "."); return ((p[1] * 256 + p[2]) * 256 + p[3]) * 256 + p[4] }
+        BEGIN { split(net, x, "/"); size = 2 ^ (32 - (x[2] == "" ? 32 : x[2])); base = int(num(x[1]) / size) }
+        FILENAME == vfile { split($0, a, "|"); seen[a[2]] = 1; next }
+        !($2 in seen) && !u[$2]++ && int(num($1) / size) != base { print $1, $2 }' \
+        "$DIR/verdicts" "$1" | grep -vEi "$NEVER"
+}
+
+# Обход имён, которые в доме уже открывали: ловит блокировки без следов в ядре.
+# Свежие имена — первыми, остальные вперемешку. Российские, завёрнутые в
+# туннель и уже проверенные пропускаются.
+sweep() {
+    tail -400 "$DIR/ipmap" |
+        awk '{ a[NR] = $0 } END { for (i = NR; i >= 1; i--) print a[i] }' > "$DIR/recent"
+    { sweep_filter "$DIR/recent"
+      sweep_filter "$DIR/ipmap" |
+          awk 'BEGIN { srand() } { print rand(), $0 }' | sort -n | cut -d' ' -f2-
+    } | awk '!s[$2]++' | head -20 > "$DIR/sweep"
+    while read -r sip sdom; do
+        check_one "$sip" "обход" "$sdom" || break
+    done < "$DIR/sweep"
+}
+
+# --- связь с бэкендом: файл доменов -----------------------------------------
+pending() {
+    [ -f "$DIR/verdicts" ] || return 0
+    [ -n "$NEVER" ] || build_never
+    awk -F'|' -v now="$(date +%s)" \
+        '$3 == "ЗАБЛОКИРОВАН" && $4 + 0 >= 2 && $2 != "-" && now - $6 < 86400 { print $2 }' \
+        "$DIR/verdicts" | sort -u | grep -vEi "$NEVER" |
+        while read -r d; do
+            grep -qxiF "$d" "$DOMAINS_FILE" 2>/dev/null && continue
+            # уже есть в каком-то списке бэкенда — решение там принято до нас
+            via_backend "$d" && continue
+            echo "$d"
+        done
+}
+
+hooked_section() {
+    [ -n "$BACKEND" ] || return 0
+    uci show "$BACKEND" 2>/dev/null |
+        grep -F "$DOMAINS_FILE" |
+        sed -n "s/^$BACKEND\.\([A-Za-z0-9_]*\)\.local_domain_lists=.*/\1/p" |
+        head -1
+}
+
+hooked_up() { [ -n "$(hooked_section)" ]; }
+
+# Набор, который бэкенд собрал из нашего файла. sing-box перечитывает его сам.
+live_ruleset() {
+    _s=$(hooked_section); [ -n "$_s" ] || return 1
+    _f="$RULESET_DIR/$_s-local-domains-ruleset.json"
+    [ -f "$_f" ] || return 1
+    echo "$_f"
+}
+
+inject_live() {   # домены через перевод строки
+    _f=$(live_ruleset) || return 1
+    cp -f "$_f" "$_f.bw-bak" 2>/dev/null || return 1
+    _arr=$(echo "$1" | jq -R -s 'split("\n") | map(select(length > 0))')
+    jq --argjson add "$_arr" '
+        if ((.rules // []) | length) == 0 then .rules = [{ domain_suffix: $add }]
+        else .rules[0].domain_suffix = (((.rules[0].domain_suffix // []) + $add) | unique) end
+    ' "$_f.bw-bak" > "$_f.bw-new" 2>/dev/null &&
+        jq -e . "$_f.bw-new" >/dev/null 2>&1 || { rm -f "$_f.bw-new"; return 1; }
+    mv "$_f.bw-new" "$_f"
+
+    _d=$(echo "$1" | head -1)
+    for _i in 1 2 3 4 5 6; do
+        sleep 2
+        via_backend "$_d" && { rm -f "$_f.bw-bak"; return 0; }
+    done
+    mv -f "$_f.bw-bak" "$_f"
+    return 1
+}
+
+export_domains() {   # [auto]
+    mkdir -p "$(dirname "$DOMAINS_FILE")" "$STATE_DIR"; touch "$DOMAINS_FILE"
+    _today=$(grep -c "^$(date '+%Y-%m-%d') .*ДОБАВЛЕН" "$LOG" 2>/dev/null); _today=${_today:-0}
+    _room=$((MAX_DAY - _today)); [ "$_room" -gt "$MAX_EXPORT" ] && _room=$MAX_EXPORT
+    if [ "$_room" -le 0 ]; then
+        [ -n "$(pending | head -1)" ] &&
+            logger -t blockwatch "дневной предел $MAX_DAY доменов исчерпан, перенос отложен"
+        jq -n '{added: [], applied: false, mode: "limit", message: "дневной предел исчерпан"}'
+        return 0
+    fi
+    _add=$(pending | head -"$_room")
+    if [ -z "$_add" ]; then
+        jq -n '{added: [], applied: false, mode: "none", message: "новых доменов нет"}'
+        return 0
+    fi
+    {
+        [ -s "$DOMAINS_FILE" ] || echo "# Домены, которые blockwatch нашёл заблокированными и проверил опытом."
+        echo "# $(date '+%Y-%m-%d %H:%M')"
+        echo "$_add"
+    } >> "$DOMAINS_FILE"
+    for d in $_add; do
+        echo "$(date '+%Y-%m-%d %H:%M') ДОБАВЛЕН $d" >> "$LOG"
+    done
+    logger -t blockwatch "добавлено в список: $(echo $_add)"
+
+    _ok=false; _mode=nohook; _msg="записано в файл; файл ещё не подключён к $BACKEND"
+    if hooked_up; then
+        if inject_live "$_add"; then
+            _ok=true; _mode=live; _msg="применено на лету, соединения не рвались"
+        elif [ "$1" = auto ]; then
+            # автоматика бэкенд не перезапускает никогда: домен уже в файле и
+            # применится при ближайшем его перезапуске
+            _mode="file"; _msg="записано в файл; применится при перезапуске $BACKEND"
+        else
+            ( trap "" HUP; /usr/bin/blockwatch apply-bg >/dev/null 2>&1 & ) </dev/null
+            _ok=true; _mode=restart; _msg="записано; $BACKEND перезапускается"
+        fi
+    fi
+    jq -n --arg t "$(date '+%H:%M')" --arg m "$_msg" --arg mode "$_mode" \
+        '{state: $mode, at: $t, message: $m}' > "$DIR/apply.json"
+    jq -n --argjson a "$(echo "$_add" | jq -R -s 'split("\n") | map(select(length > 0))')" \
+          --argjson r "$_ok" --arg m "$_msg" --arg mode "$_mode" \
+          '{added: $a, applied: $r, mode: $mode, message: $m}'
+}
+
+# Жив ли бэкенд. `/etc/init.d/<бэкенд> running` сразу после перезапуска врёт
+# «нет», поэтому смотрим на настоящие признаки: живой sing-box и fakeip.
+healthy() {
+    pidof sing-box >/dev/null 2>&1 || return 1
+    via_backend "$FAKEIP_TEST" && return 0
+    [ -n "$NFT_SET" ] || return 1
+    _n=$(nft -j list set inet "$NFT_TABLE" "$NFT_SET" 2>/dev/null |
+         jq '[.nftables[]?.set?.elem[]?] | length')
+    [ "${_n:-0}" -gt 0 ]
+}
+
+apply_bg() {
+    jq -n --arg t "$(date '+%H:%M')" --arg b "$BACKEND" \
+        '{state: "restart", at: $t, message: "\($b) перезапускается"}' > "$DIR/apply.json"
+    "/usr/bin/$BACKEND" reload >/dev/null 2>&1
+    sleep 12
+    if healthy; then _m="$BACKEND перезапущен, список применён"
+    else
+        "/usr/bin/$BACKEND" restart >/dev/null 2>&1
+        sleep 12
+        if healthy; then _m="$BACKEND поднялся со второй попытки"
+        else _m="$BACKEND не поднялся — нужна проверка вручную"; fi
+    fi
+    jq -n --arg t "$(date '+%H:%M')" --arg m "$_m" \
+        '{state: "done", at: $t, message: $m}' > "$DIR/apply.json"
+    logger -t blockwatch "$_m"
+}
+
+# --- состояние -----------------------------------------------------------------
+problems() {   # по строке на проблему
+    [ -n "$BACKEND" ] || { echo "не найден netshift или podkop"; return; }
+    [ "$(cfg enabled 1)" = 1 ] || echo "наблюдатель выключен (blockwatch.main.enabled=0)"
+    grep -q "blockwatch scan" /etc/crontabs/root 2>/dev/null ||
+        echo "нет задания в cron — выполни /etc/init.d/blockwatch start"
+    if [ -f "$DIR/tunnel" ]; then
+        read -r _ts _ok _d _t _s < "$DIR/tunnel"
+        if [ "$_ok" != 1 ]; then
+            if [ "${_s:--}" = - ]; then
+                echo "не найден socks-вход sing-box: включи в $BACKEND загрузку списков через прокси"
+            else
+                echo "через socks-вход $_s выход тот же, что напрямую ($_d) — это не туннель"
+            fi
+        fi
+    fi
+    hooked_up || echo "файл $DOMAINS_FILE не подключён к $BACKEND: blockwatch hook <секция>"
+    if hooked_up && ! live_ruleset >/dev/null; then
+        echo "файл подключён, но $BACKEND ещё не собрал из него список — перезапусти $BACKEND один раз"
+    fi
+    [ "$(uci -q get dhcp.@dnsmasq[0].logqueries)" = 1 ] ||
+        echo "выключен журнал запросов dnsmasq — не будет имён сайтов"
+    [ "$(cat /proc/sys/net/netfilter/nf_conntrack_acct 2>/dev/null)" = 1 ] ||
+        echo "выключен учёт трафика conntrack — обрывы не распознаются"
+}
+
+json_lines() { jq -R -s 'split("\n") | map(select(length > 0))'; }
+
+status_json() {
+    mkdir -p "$(dirname "$DOMAINS_FILE")"; touch "$DOMAINS_FILE" 2>/dev/null
+    touch "$DIR/verdicts"
+    _found=$(awk -F'|' '$3 == "ЗАБЛОКИРОВАН" {
+                 printf "%s\t%s\t%s\t%s\t%s\n", $1, $2, $4, $7, $8 }' "$DIR/verdicts" |
+             jq -R -s 'split("\n") | map(select(length > 0) | split("\t") |
+                       { ip: .[0], domain: .[1], confirmed: ((.[2] | tonumber) >= 2),
+                         why: .[3], codes: .[4] })')
+    _pend=$(pending | json_lines)
+    _added=$(awk '/^# [0-9][0-9][0-9][0-9]-/ { at = $2 " " $3; next }
+                  /^[[:space:]]*(#|$)/ { next } { print $1, at }' "$DOMAINS_FILE" 2>/dev/null |
+        while read -r d a1 a2; do
+            if via_backend "$d"; then l=true; else l=false; fi
+            printf '%s\t%s %s\t%s\n' "$d" "$a1" "$a2" "$l"
+        done | jq -R -s 'split("\n") | map(select(length > 0) | split("\t") |
+                         { domain: .[0], at: .[1], live: (.[2] == "true") }) | reverse')
+    _counts=$(awk -F'|' '{ n[$3]++ } END { printf "%d %d %d", NR, n["живой"], n["лежит"] }' "$DIR/verdicts")
+    set -- $_counts
+    if scan_running; then _run=true; else _run=false; fi
+    _apply=$(jq -c . "$DIR/apply.json" 2>/dev/null); [ -n "$_apply" ] || _apply=null
+    _tun=null
+    if [ -f "$DIR/tunnel" ]; then
+        read -r _ts _ok _d _t _s < "$DIR/tunnel"
+        _tun=$(jq -n --argjson ok "$([ "$_ok" = 1 ] && echo true || echo false)" \
+            --arg direct "$_d" --arg tunnel "$_t" --arg socks "$_s" --argjson at "${_ts:-0}" \
+            '{ok: $ok, direct: $direct, tunnel: $tunnel, socks: $socks, at: $at}')
+    fi
+    jq -n --arg version "$VERSION" --arg backend "${BACKEND:-}" \
+          --arg file "$DOMAINS_FILE" --arg section "$(hooked_section)" \
+          --argjson found "$_found" --argjson pending "$_pend" --argjson added "$_added" \
+          --argjson checked "${1:-0}" --argjson alive "${2:-0}" --argjson down "${3:-0}" \
+          --argjson running "$_run" --argjson apply "$_apply" --argjson tunnel "$_tun" \
+          --argjson problems "$(problems | json_lines)" \
+          '{version: $version, backend: $backend, file: $file,
+            hooked: ($section != ""), section: $section,
+            checked: $checked, alive: $alive, down: $down, running: $running,
+            tunnel: $tunnel, apply: $apply, problems: $problems,
+            added: $added, found: $found, pending: $pending}'
+}
+
+report() {
+    echo "blockwatch $VERSION, бэкенд: ${BACKEND:-не найден}, $(date '+%d.%m %H:%M')"
+    problems | sed 's/^/  ! /'
+    echo
+    touch "$DIR/verdicts"
+    if [ "$1" = all ]; then
+        rows=$(sort -t'|' -k3,3 "$DIR/verdicts")
+    else
+        rows=$(grep '|ЗАБЛОКИРОВАН|' "$DIR/verdicts" | sort -t'|' -k4,4nr)
+    fi
+    if [ -n "$rows" ]; then
+        echo "АДРЕС            САЙТ                               САЙТ/АДР/ТУН  ВЕРДИКТ / признак"
+        echo "$rows" | while IFS='|' read -r ip dom v hits _first _last why codes; do
+            [ "$v" = "ЗАБЛОКИРОВАН" ] && [ "$hits" -ge 2 ] && v="$v (подтверждён)"
+            printf "%-16s %-34s %-13s %s\n" "$ip" "$(echo "$dom" | cut -c1-34)" "$codes" "$v / $why"
+        done
+    else
+        echo "блокировок пока не найдено"
+    fi
+    echo
+    awk -F'|' '{ n[$3]++ } END {
+        printf "проверено адресов: %d — живых %d, лежит %d, заблокировано %d\n",
+               NR, n["живой"], n["лежит"], n["ЗАБЛОКИРОВАН"] }' "$DIR/verdicts"
+    echo "в списке доменов: $(grep -cvE '^[[:space:]]*(#|$)' "$DOMAINS_FILE" 2>/dev/null)"
+    [ "$1" = all ] || echo "весь список, включая живых: blockwatch report all"
+}
+
+# --- установка в систему ---------------------------------------------------------
+cron_on() {
+    touch /etc/crontabs/root
+    grep -q "blockwatch scan" /etc/crontabs/root ||
+        echo "*/2 * * * * /usr/bin/blockwatch scan >/dev/null 2>&1" >> /etc/crontabs/root
+    /etc/init.d/cron restart >/dev/null 2>&1
+}
+
+cron_off() {
+    sed -i '/blockwatch scan/d' /etc/crontabs/root 2>/dev/null
+    /etc/init.d/cron restart >/dev/null 2>&1
+    nft delete table inet blockwatch 2>/dev/null
+}
+
+setup_system() {
+    mkdir -p "$STATE_DIR"
+    # запоминаем, как было, чтобы uninstall вернул ровно это
+    if [ ! -f "$SAVED" ]; then
+        {
+            echo "log_size=$(uci -q get system.@system[0].log_size)"
+            echo "logqueries=$(uci -q get dhcp.@dnsmasq[0].logqueries)"
+            echo "acct=$(cat /proc/sys/net/netfilter/nf_conntrack_acct 2>/dev/null)"
+        } > "$SAVED"
+    fi
+    # Порядок важен: сначала служба журнала, потом dnsmasq. Перезапуск службы
+    # журнала подменяет сокет /dev/log, и демоны, запущенные раньше, молча
+    # перестают в него писать.
+    if [ "$(uci -q get system.@system[0].log_size || echo 0)" -lt 512 ] 2>/dev/null; then
+        uci set system.@system[0].log_size='512' && uci commit system
+        /etc/init.d/log restart >/dev/null 2>&1
+        echo "буфер журнала: 512 КБ (в ОЗУ)"
+    fi
+    if [ "$(uci -q get dhcp.@dnsmasq[0].logqueries)" != 1 ]; then
+        uci set dhcp.@dnsmasq[0].logqueries='1' && uci commit dhcp
+        echo "журнал запросов dnsmasq: включён (в ОЗУ)"
+    fi
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1
+    if [ "$(cat /proc/sys/net/netfilter/nf_conntrack_acct 2>/dev/null)" = 0 ]; then
+        echo "net.netfilter.nf_conntrack_acct=1" > /etc/sysctl.d/99-blockwatch.conf
+        sysctl -w net.netfilter.nf_conntrack_acct=1 >/dev/null 2>&1
+        echo "учёт трафика conntrack: включён"
+    fi
+    # переезд со старой раскладки файлов
+    [ -f /root/blockwatch.log ] && [ ! -f "$LOG" ] && mv /root/blockwatch.log "$LOG"
+    [ -f /root/blockwatch.state ] && [ ! -f "$STATE" ] && mv /root/blockwatch.state "$STATE"
+    rm -f /root/blockwatch.state /etc/blockwatch.nft
+    touch "$DOMAINS_FILE"
+    /etc/init.d/blockwatch enable >/dev/null 2>&1
+    cron_on
+}
+
+restore_system() {
+    cron_off
+    if [ -f "$SAVED" ]; then
+        log_size=""; logqueries=""; acct=""
+        # shellcheck disable=SC1090  # файл пишет setup_system
+        . "$SAVED"
+        if [ -n "$log_size" ]; then uci set system.@system[0].log_size="$log_size"
+        else uci -q delete system.@system[0].log_size; fi
+        uci commit system
+        /etc/init.d/log restart >/dev/null 2>&1
+        if [ -n "$logqueries" ]; then uci set dhcp.@dnsmasq[0].logqueries="$logqueries"
+        else uci -q delete dhcp.@dnsmasq[0].logqueries; fi
+        uci commit dhcp
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1
+        if [ -f /etc/sysctl.d/99-blockwatch.conf ]; then
+            rm -f /etc/sysctl.d/99-blockwatch.conf
+            [ "$acct" = 0 ] && sysctl -w net.netfilter.nf_conntrack_acct=0 >/dev/null 2>&1
+        fi
+        rm -f "$SAVED"
+    fi
+    rm -rf "$DIR"
+}
+
+hook() {   # секция
+    [ -n "$BACKEND" ] || { echo "не найден netshift или podkop"; return 1; }
+    _sec=${1:-main}
+    uci -q get "$BACKEND.$_sec" >/dev/null || { echo "нет секции $BACKEND.$_sec"; return 1; }
+    if [ -n "$(hooked_section)" ]; then
+        echo "уже подключён: секция $(hooked_section)"
+        return 0
+    fi
+    touch "$DOMAINS_FILE"
+    uci add_list "$BACKEND.$_sec.local_domain_lists=$DOMAINS_FILE" && uci commit "$BACKEND"
+    echo "подключён к $BACKEND.$_sec; $BACKEND перезапускается один раз, чтобы собрать список"
+    ( trap "" HUP; /usr/bin/blockwatch apply-bg >/dev/null 2>&1 & ) </dev/null
+}
+
+unhook() {
+    [ -n "$BACKEND" ] || return 0
+    for _sec in $(uci show "$BACKEND" 2>/dev/null | grep -F "$DOMAINS_FILE" |
+                  sed -n "s/^$BACKEND\.\([A-Za-z0-9_]*\)\.local_domain_lists=.*/\1/p"); do
+        uci del_list "$BACKEND.$_sec.local_domain_lists=$DOMAINS_FILE"
+        echo "отключён от $BACKEND.$_sec (подействует после перезапуска $BACKEND)"
+    done
+    uci commit "$BACKEND"
+}
+
+doctor() {
+    echo "blockwatch $VERSION"
+    echo "бэкенд:        ${BACKEND:-не найден}"
+    [ -n "$BACKEND" ] || return 1
+    echo "константы:     $([ -f "$CONST" ] && echo "$CONST" || echo "нет, значения по умолчанию")"
+    echo "nft бэкенда:   ${NFT_TABLE:-?} / ${NFT_SET:-?}, метка $MARK"
+    echo "DNS sing-box:  $DNS, fakeip $FAKEIP_RANGE"
+    echo "конфиг:        $SB_CONFIG"
+    echo "наборы:        $RULESET_DIR"
+    detect_socks && echo "socks-вход:    $SOCKS" || echo "socks-вход:    не найден"
+    echo "выход в сеть:  $(wan_devs | tr '\n' ' ')"
+    printf "туннель:       "
+    if tunnel_check force; then
+        read -r _ts _ok _d _t _s < "$DIR/tunnel"
+        echo "есть ($_d напрямую, $_t через туннель)"
+    else
+        read -r _ts _ok _d _t _s < "$DIR/tunnel"
+        echo "НЕТ ($_d напрямую, ${_t:--} через socks)"
+    fi
+    echo "файл доменов:  $DOMAINS_FILE, секция: $(hooked_section || true)"
+    echo "живой список:  $(live_ruleset || echo нет)"
+    printf "бэкенд здоров: "; healthy && echo да || echo нет
+    echo
+    _p=$(problems)
+    if [ -n "$_p" ]; then echo "Проблемы:"; echo "$_p" | sed 's/^/  - /'
+    else echo "Проблем не найдено."; fi
+}
+
+case "$1" in
+    scan)      scan ;;
+    report)    report "$2" ;;
+    status)    status_json ;;
+    export)    export_domains "$2" ;;
+    apply-bg)  apply_bg ;;
+    hook)      hook "$2" ;;
+    unhook)    unhook ;;
+    doctor)    doctor ;;
+    install)   setup_system ;;
+    uninstall)
+        restore_system
+        # через if, а не через &&: без --purge цепочка `[ ] && …` вернула бы 1,
+        # и установщик под set -e оборвался бы, не удалив файлы
+        if [ "$2" = --purge ]; then
+            unhook
+            rm -rf "$STATE_DIR"
+        fi
+        ;;
+    cron-on)   cron_on ;;
+    cron-off)  cron_off ;;
+    version)   echo "$VERSION" ;;
+    *)
+        cat <<EOF
+blockwatch $VERSION — наблюдатель за блокировками для netshift/podkop
+
+  blockwatch report [all]    что найдено
+  blockwatch doctor          проверить установку и туннель
+  blockwatch hook [секция]   подключить файл доменов к $BACKEND (перезапустит его)
+  blockwatch unhook          отключить файл доменов
+  blockwatch export          перенести подтверждённое сейчас
+  blockwatch status          состояние в JSON (для вкладки LuCI)
+EOF
+        ;;
+esac

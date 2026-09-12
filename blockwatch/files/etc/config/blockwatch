@@ -1,0 +1,33 @@
+config blockwatch 'main'
+	# 0 — заходы не выполняются
+	option enabled '1'
+
+	# auto | netshift | podkop
+	option backend 'auto'
+
+	# Этот файл подключается в netshift/podkop как Local Domain List
+	# (или командой: blockwatch hook main)
+	option domains_file '/etc/blockwatch/domains.txt'
+
+	# 1 — подтверждённые блокировки дописываются в файл сами
+	option auto_export '1'
+
+	# Не больше стольких доменов в сутки: страховка от лавины ложных находок
+	option max_per_day '30'
+
+	# Домены с этими окончаниями не добавляются никогда. Российские — потому
+	# что через зарубежный выход они часто отказывают; видеоузлы Google —
+	# потому что в ссылках на видео зашит адрес узла. Имена своих серверов
+	# из конфига sing-box добавляются в этот список сами.
+	list never_suffix 'ru'
+	list never_suffix 'su'
+	list never_suffix 'xn--p1ai'
+	list never_suffix 'googlevideo.com'
+	list never_suffix 'gvt1.com'
+
+	# Ручная настройка — только если автоопределение не справилось
+	# (посмотреть, что определилось: blockwatch doctor)
+	#option socks '127.0.0.1:4534'
+	#option dns '127.0.0.42'
+	#option fakeip_range '198.18.0.0/15'
+	#option fakeip_mark '0x00100000'

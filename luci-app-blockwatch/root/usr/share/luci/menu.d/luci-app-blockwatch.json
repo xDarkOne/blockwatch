@@ -1,0 +1,13 @@
+{
+  "admin/services/blockwatch": {
+    "title": "Blockwatch",
+    "order": 43,
+    "action": {
+      "type": "view",
+      "path": "blockwatch/blockwatch"
+    },
+    "depends": {
+      "acl": [ "luci-app-blockwatch" ]
+    }
+  }
+}

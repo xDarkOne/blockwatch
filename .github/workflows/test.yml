@@ -1,0 +1,44 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: |
+          sudo apt-get install -y shellcheck >/dev/null
+          shellcheck -s sh -S warning \
+            blockwatch/files/usr/bin/blockwatch \
+            blockwatch/files/etc/init.d/blockwatch \
+            install.sh tests/smoke.sh
+
+      - name: JavaScript
+        run: node --check luci-app-blockwatch/htdocs/luci-static/resources/view/blockwatch/blockwatch.js
+
+      - name: JSON
+        run: |
+          for f in luci-app-blockwatch/root/usr/share/luci/menu.d/*.json \
+                   luci-app-blockwatch/root/usr/share/rpcd/acl.d/*.json; do
+            jq -e . "$f" >/dev/null
+          done
+
+  smoke:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        openwrt: ["24.10", "25.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: OpenWrt ${{ matrix.openwrt }}
+        run: bash tests/run-rootfs.sh ${{ matrix.openwrt }}

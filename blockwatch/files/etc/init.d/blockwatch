@@ -1,0 +1,17 @@
+#!/bin/sh /etc/rc.common
+# blockwatch сам по себе не служба: работу делают заходы по cron.
+# start/stop включают и выключают эти заходы.
+
+# shellcheck disable=SC2034  # START и STOP читает /etc/rc.common
+START=99
+# shellcheck disable=SC2034
+STOP=10
+
+start() {
+	[ "$(uci -q get blockwatch.main.enabled)" = "0" ] && return 0
+	/usr/bin/blockwatch cron-on
+}
+
+stop() {
+	/usr/bin/blockwatch cron-off
+}
