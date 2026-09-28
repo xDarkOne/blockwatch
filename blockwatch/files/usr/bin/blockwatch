@@ -27,7 +27,7 @@
 #
 # https://github.com/xDarkOne/blockwatch — GPL-2.0
 
-VERSION=0.1.0
+VERSION=0.1.1
 CONFIG=blockwatch
 DIR=/tmp/blockwatch                     # рабочее состояние: ОЗУ, флеш не трогаем
 STATE_DIR=/etc/blockwatch               # на флеш — только находки и настройки
@@ -176,13 +176,18 @@ exit_ip() {   # [socks] -> внешний адрес
 
 # Кэш на час в $DIR/tunnel: «время годен прямой_адрес адрес_через_туннель».
 # status читает только кэш — сеть трогает заход или doctor.
+# socks-вход ищем всегда, и при свежем кэше тоже: probe берёт его из $SOCKS.
+# В 0.1.0 при свежем кэше $SOCKS оставался пустым, curl шёл на «socks5://»
+# без адреса, и 59 минут из 60 туннель «не отвечал» — заблокированное
+# записывалось в «лежит».
 tunnel_check() {   # [force]
-    if [ "$1" != force ] && [ -f "$DIR/tunnel" ]; then
-        read -r _ts _ok _d _t < "$DIR/tunnel"
-        [ $((now - ${_ts:-0})) -lt 3600 ] && { [ "$_ok" = 1 ]; return; }
+    detect_socks || SOCKS=""
+    if [ "$1" != force ] && [ -f "$DIR/tunnel" ] && [ -n "$SOCKS" ]; then
+        read -r _ts _ok _d _t _s < "$DIR/tunnel"
+        [ "$_s" = "$SOCKS" ] && [ $((now - ${_ts:-0})) -lt 3600 ] && { [ "$_ok" = 1 ]; return; }
     fi
     _ok=0; _d=""; _t=""
-    if detect_socks; then
+    if [ -n "$SOCKS" ]; then
         _d=$(exit_ip)
         _t=$(exit_ip "$SOCKS")
         [ -n "$_t" ] && [ "$_t" != "$_d" ] && _ok=1
@@ -383,6 +388,7 @@ scan() {
     trap 'rm -f "$DIR/lock"' EXIT INT TERM
     touch "$DIR/ipmap" "$DIR/silent" "$DIR/verdicts" "$DIR/flows"
     [ -s "$DIR/verdicts" ] || { [ -s "$STATE" ] && cp -f "$STATE" "$DIR/verdicts"; }
+    forget_blind_down
 
     if [ -z "$BACKEND" ]; then
         logger -t blockwatch "не найден netshift/podkop — заход пропущен"
@@ -461,6 +467,16 @@ scan() {
     tail -400 "$DIR/verdicts" > "$DIR/v.trim" && mv "$DIR/v.trim" "$DIR/verdicts"
     mkdir -p "$STATE_DIR"
     same_file "$DIR/verdicts" "$STATE" || cp -f "$DIR/verdicts" "$STATE"
+}
+
+# Один раз после обновления с 0.1.0: её «лежит» почти все получены без
+# туннеля (см. tunnel_check) и ничего не значат. Выбрасываем — обход проверит
+# эти имена заново. «Живой» и «ЗАБЛОКИРОВАН» от той ошибки не зависели.
+forget_blind_down() {
+    [ "$(cat "$STATE_DIR/verdicts.v" 2>/dev/null)" = 2 ] && return 0
+    awk -F'|' '$3 != "лежит"' "$DIR/verdicts" > "$DIR/v.tmp" 2>/dev/null &&
+        mv "$DIR/v.tmp" "$DIR/verdicts"
+    mkdir -p "$STATE_DIR"; echo 2 > "$STATE_DIR/verdicts.v"
 }
 
 check_one() {   # адрес, признак, [имя]

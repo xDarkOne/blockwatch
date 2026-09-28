@@ -104,6 +104,12 @@ V() { sh -c ". /usr/bin/blockwatch >/dev/null 2>&1; verdict_of $1 $2 $3"; }
 check "000~/200/200 — живой (адрес ответил)" test "$(V '000~' 200 200)" = "живой"
 check "200~/200~/200 — заблокирован (обрыв)" test "$(V '200~' '200~' 200)" = "ЗАБЛОКИРОВАН"
 check "000/000/000 — лежит" test "$(V 000 000 000)" = "лежит"
+# при свежем кэше туннеля socks-адрес всё равно должен быть известен: в 0.1.0
+# он оставался пустым, и проверка через туннель 59 минут из 60 шла вхолостую
+T=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; now=10000; mkdir -p $DIR
+    echo "9999 1 198.51.100.1 198.51.100.2 127.0.0.1:4534" > $DIR/tunnel
+    tunnel_check && echo "ok $SOCKS"; rm -f $DIR/tunnel')
+check "свежий кэш туннеля: socks известен" test "$T" = "ok 127.0.0.1:4534"
 check "in_range fakeip" sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; in_range 198.19.3.4 198.18.0.0/15'
 check "in_range чужой" sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; ! in_range 198.20.0.1 198.18.0.0/15'
 
@@ -128,6 +134,18 @@ sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; build_never; sweep_filter /tmp/bw-
 check "4000 имён за пару секунд" test $(( $(date +%s) - S )) -le 3
 check "все 4000 прошли фильтр" test "$(wc -l < /tmp/bw-sweep)" = 4000
 rm -f /tmp/bw-ipmap /tmp/bw-sweep /tmp/blockwatch/verdicts
+
+echo "== после 0.1.0: её «лежит» недостоверны"
+rm -f /etc/blockwatch/verdicts.v
+printf '%s\n' '203.0.113.30|down.example.com|лежит|0|1|1|обход|000~/000~/000~' \
+    '203.0.113.31|up.example.com|живой|0|1|1|обход|200/-/-' > /tmp/blockwatch/verdicts
+sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; forget_blind_down'
+check "старое «лежит» выброшено" sh -c "! grep -q down.example.com /tmp/blockwatch/verdicts"
+check "«живой» остался" grep -q up.example.com /tmp/blockwatch/verdicts
+echo '203.0.113.32|new.example.com|лежит|0|2|2|сброс|000~/000~/000~' >> /tmp/blockwatch/verdicts
+sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; forget_blind_down'
+check "чистка только один раз" grep -q new.example.com /tmp/blockwatch/verdicts
+rm -f /tmp/blockwatch/verdicts /etc/blockwatch/verdicts.v
 
 echo "== hook / unhook"
 blockwatch hook main >/dev/null 2>&1
