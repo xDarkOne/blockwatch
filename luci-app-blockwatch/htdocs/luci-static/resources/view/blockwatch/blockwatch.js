@@ -37,7 +37,7 @@ function statusBlock(st) {
 	nodes.push(E('p', {}, [
 		'blockwatch ' + st.version + ' · ' + backendName(st) + ' · ',
 		st.running ? 'идёт заход' : 'между заходами',
-		' · проверено адресов: ' + st.checked + ', живых: ' + st.alive + ', лежит: ' + st.down
+		' · проверено сайтов: ' + st.checked + ', живых: ' + st.alive + ', лежит: ' + st.down
 	]));
 
 	if (st.tunnel)

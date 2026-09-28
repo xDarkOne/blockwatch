@@ -279,16 +279,64 @@ set_counts() {
 }
 
 # --- имена сайтов из журнала запросов dnsmasq --------------------------------
+# Адрес привязывается к имени, которое спросил браузер, а не к концу цепочки
+# CNAME: у www.example.com за Vercel или CDN ответ приходит на служебное имя
+# вроде 74db….vercel-dns-016.com. Проверять надо то имя, которое спрашивали —
+# по служебному хостинг отдаёт короткий 404, он пролезает под обрыв на ~16 КБ,
+# и заблокированный сайт выходит «живым»; да и туннель выбирается по имени
+# запроса. Все строки одного запроса dnsmasq метит номером после тега.
+#
+# Разбор идёт каждые 15 с по всему журналу, поэтому строки отбирает grep, а awk
+# ищет нужное одним регулярным выражением: перебор полей в busybox awk на
+# 4000 строках занимал на роутере ~1,7 с, так — ~1,1 с.
 update_ipmap() {
-    logread 2>/dev/null | awk '
-        / dnsmasq\[/ {
-            for (i = 1; i <= NF; i++)
-                if (($i == "reply" || $i == "cached") && $(i+2) == "is" &&
-                    $(i+3) ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/)
-                    print $(i+3), $(i+1)
+    logread 2>/dev/null |
+    grep -E ' dnsmasq\[[0-9]+\]:.* (query\[[A-Za-z0-9]+\]|reply|cached) ' | awk '
+        {
+            id = ""
+            if (match($0, /dnsmasq\[[0-9]+\]: [0-9]+ /)) {
+                id = substr($0, RSTART, RLENGTH - 1); sub(/.* /, "", id)
+            }
+            if (match($0, / query\[[A-Za-z0-9]+\] [^ ]+/)) {
+                s = substr($0, RSTART + 1, RLENGTH - 1); sub(/^[^ ]+ /, "", s)
+                if (id != "") q[id] = s
+                chain = ""
+                next
+            }
+            if (match($0, / (reply|cached) [^ ]+ is [^ ]+$/)) {
+                split(substr($0, RSTART + 1), w, " ")
+                orig = w[2]; name = orig; v = w[4]
+                if (id != "" && (id in q)) name = q[id]
+                else if (chain != "") name = chain
+                if (orig != name) site[orig] = name
+                # без номеров в журнале цепочку ведём по соседним строкам
+                if (v == "<CNAME>") { if (chain == "") chain = name }
+                else if (v ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) { n++; ip[n] = v; nm[n] = name }
+                else chain = ""
+            }
+        }
+        # Служебное имя из цепочки клиенты спрашивают и напрямую, в том числе
+        # раньше, чем цепочка попала в журнал, — поэтому имена разрешаем, когда
+        # прочитан весь журнал. Адрес всё равно принадлежит сайту.
+        END {
+            for (k = 1; k <= n; k++) {
+                name = nm[k]
+                for (s = 0; s < 5 && (name in site); s++) name = site[name]
+                print ip[k], name
+            }
         }' > "$DIR/ipmap.new" 2>/dev/null
     [ -s "$DIR/ipmap.new" ] || { rm -f "$DIR/ipmap.new"; return 0; }
-    cat "$DIR/ipmap" "$DIR/ipmap.new" 2>/dev/null | awk '!seen[$0]++' |
+    # журнал стоит (ночью, в пустом доме) — нечего и сливать
+    _sum=$(md5sum < "$DIR/ipmap.new")
+    if [ -s "$DIR/ipmap" ] && [ "$_sum" = "$(cat "$DIR/ipmap.sum" 2>/dev/null)" ]; then
+        rm -f "$DIR/ipmap.new"; return 0
+    fi
+    echo "$_sum" > "$DIR/ipmap.sum"
+    # повтор пары переезжает в конец: domain_of берёт последнюю строку адреса,
+    # и свежая привязка должна перебивать устаревшую
+    cat "$DIR/ipmap" "$DIR/ipmap.new" 2>/dev/null |
+        awk '{ a[NR] = $0 } END { for (i = NR; i >= 1; i--) if (!s[a[i]]++) b[++m] = a[i]
+                                  for (i = m; i >= 1; i--) print b[i] }' |
         tail -4000 > "$DIR/ipmap.tmp"
     mv "$DIR/ipmap.tmp" "$DIR/ipmap"; rm -f "$DIR/ipmap.new"
 }
@@ -447,8 +495,7 @@ scan() {
 
         # недоподтверждённое доводим до конца: к именам с вердиктом обход не
         # возвращается, и второй проверки иначе не было бы никогда
-        awk -F'|' -v now="$now" '$3 == "ЗАБЛОКИРОВАН" && $4 + 0 < 2 && now - $6 >= 900 {
-            print $1, $7, $2 }' "$DIR/verdicts" > "$DIR/redo" 2>/dev/null
+        redo_list > "$DIR/redo" 2>/dev/null
         while read -r rip rwhy rdom; do
             [ "$rdom" = "-" ] && rdom=""
             check_one "$rip" "$rwhy" "$rdom" || break
@@ -469,6 +516,28 @@ scan() {
     same_file "$DIR/verdicts" "$STATE" || cp -f "$DIR/verdicts" "$STATE"
 }
 
+# Что перепроверить через 15 минут, не дожидаясь RECHECK: недоподтверждённые
+# блокировки и «лежит», проверенное лишь раз по признаку в трафике. Во втором
+# случае мог на миг не ответить сам туннель — так noodledude.io лёг на 6 часов
+# с кодами 000~/000~/000~, хотя через туннель открывался. «Лежит» из обхода не
+# берём: это в основном служебные имена без страницы в корне, их сотни, и на
+# каждое ушло бы ~26 с таймаутов. Старше RECHECK — тоже. Свежие — первыми.
+redo_list() {
+    # время — в начало строки: `sort -t'|' -k6,6nr` в разных sort ведёт себя по-разному
+    awk -F'|' '{ print $6 " " $0 }' "$DIR/verdicts" | sort -rn | cut -d' ' -f2- |
+    awk -F'|' -v now="$now" -v rc="$RECHECK" '
+        now - $6 >= 900 && (($3 == "ЗАБЛОКИРОВАН" && $4 + 0 < 2) ||
+                            ($3 == "лежит" && $5 == $6 && $7 != "обход" && now - $6 < rc)) {
+            print $1, $7, $2 }'
+}
+
+# Вердикт хранится на пару «адрес + имя»: за одним адресом Vercel, Cloudflare
+# или CDN живут сотни сайтов, и вердикт одного не должен закрывать проверку
+# другого.
+verdict_line() {   # адрес имя
+    awk -F'|' -v ip="$1" -v d="$2" '$1 == ip && $2 == d' "$DIR/verdicts" 2>/dev/null | tail -1
+}
+
 # Один раз после обновления с 0.1.0: её «лежит» почти все получены без
 # туннеля (см. tunnel_check) и ничего не значат. Выбрасываем — обход проверит
 # эти имена заново. «Живой» и «ЗАБЛОКИРОВАН» от той ошибки не зависели.
@@ -485,16 +554,18 @@ check_one() {   # адрес, признак, [имя]
     [ "$checked" -ge "$MAX_TICK" ] && return 1
     [ "$checked_run" -ge "$MAX_RUN" ] && return 1
 
-    old=$(grep "^$ip|" "$DIR/verdicts" 2>/dev/null | tail -1)
+    [ -n "$dom" ] || dom=$(domain_of "$ip")
+    old=$(verdict_line "$ip" "${dom:--}")
     if [ -n "$old" ]; then
         last=$(echo "$old" | cut -d'|' -f6)
         wait=$RECHECK
-        if [ "$(echo "$old" | cut -d'|' -f3)" = "ЗАБЛОКИРОВАН" ] &&
-           [ "$(echo "$old" | cut -d'|' -f4)" -lt 2 ]; then wait=900; fi
+        case "$(echo "$old" | cut -d'|' -f3-5)" in
+            "ЗАБЛОКИРОВАН|0|"*|"ЗАБЛОКИРОВАН|1|"*) wait=900 ;;
+            лежит\|*) [ "$(echo "$old" | cut -d'|' -f5)" = "$last" ] && wait=900 ;;
+        esac
         [ $((now - last)) -lt "$wait" ] && return 0
     fi
 
-    [ -n "$dom" ] || dom=$(domain_of "$ip")
     # shellcheck disable=SC2046  # probe печатает три кода через пробел
     set -- $(probe "$ip" "$dom")
     v=$(verdict_of "$1" "$2" "$3")
@@ -505,7 +576,7 @@ check_one() {   # адрес, признак, [имя]
     first=$(echo "$old" | cut -d'|' -f5); [ -n "$first" ] || first=$now
     if [ "$v" = "ЗАБЛОКИРОВАН" ]; then hits=$((hits + 1)); else hits=0; fi
 
-    grep -v "^$ip|" "$DIR/verdicts" 2>/dev/null > "$DIR/v.tmp"
+    awk -F'|' -v ip="$ip" -v d="${dom:--}" '!($1 == ip && $2 == d)' "$DIR/verdicts" 2>/dev/null > "$DIR/v.tmp"
     echo "$ip|${dom:--}|$v|$hits|$first|$now|$why|$codes" >> "$DIR/v.tmp"
     mv "$DIR/v.tmp" "$DIR/verdicts"
 
@@ -761,7 +832,7 @@ report() {
     fi
     echo
     awk -F'|' '{ n[$3]++ } END {
-        printf "проверено адресов: %d — живых %d, лежит %d, заблокировано %d\n",
+        printf "проверено сайтов: %d — живых %d, лежит %d, заблокировано %d\n",
                NR, n["живой"], n["лежит"], n["ЗАБЛОКИРОВАН"] }' "$DIR/verdicts"
     echo "в списке доменов: $(grep -cvE '^[[:space:]]*(#|$)' "$DOMAINS_FILE" 2>/dev/null)"
     [ "$1" = all ] || echo "весь список, включая живых: blockwatch report all"

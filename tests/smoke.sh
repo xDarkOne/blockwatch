@@ -135,6 +135,85 @@ check "4000 имён за пару секунд" test $(( $(date +%s) - S )) -le
 check "все 4000 прошли фильтр" test "$(wc -l < /tmp/bw-sweep)" = 4000
 rm -f /tmp/bw-ipmap /tmp/bw-sweep /tmp/blockwatch/verdicts
 
+echo "== карта имён: имя запроса, а не конец CNAME"
+# строки с домашнего роутера: www.noodledude.io за Vercel
+cat > /tmp/bw-log <<'EOF'
+Mon Sep 28 21:29:50 2026 daemon.info dnsmasq[1]: 106320 192.168.1.249/5002 query[A] 74db6ff77fea4b2e.vercel-dns-016.com from 192.168.1.249
+Mon Sep 28 21:29:50 2026 daemon.info dnsmasq[1]: 106320 192.168.1.249/5002 reply 74db6ff77fea4b2e.vercel-dns-016.com is 216.150.99.1
+Mon Sep 28 21:29:58 2026 daemon.info dnsmasq[1]: 106324 192.168.1.249/51251 query[A] www.noodledude.io from 192.168.1.249
+Mon Sep 28 21:29:58 2026 daemon.info dnsmasq[1]: 106324 192.168.1.249/51251 forwarded www.noodledude.io to 127.0.0.42
+Mon Sep 28 21:29:58 2026 daemon.info dnsmasq[1]: 106327 192.168.1.249/56630 query[A] plain.example.com from 192.168.1.249
+Mon Sep 28 21:29:58 2026 daemon.info dnsmasq[1]: 106327 192.168.1.249/56630 reply plain.example.com is 203.0.113.5
+Mon Sep 28 21:29:58 2026 daemon.info dnsmasq[1]: 106324 192.168.1.249/51251 reply www.noodledude.io is <CNAME>
+Mon Sep 28 21:29:58 2026 daemon.info dnsmasq[1]: 106324 192.168.1.249/51251 reply 74db6ff77fea4b2e.vercel-dns-016.com is 216.150.1.65
+Mon Sep 28 21:29:58 2026 daemon.info dnsmasq[1]: 106324 192.168.1.249/51251 reply 74db6ff77fea4b2e.vercel-dns-016.com is 216.150.16.65
+Mon Sep 28 21:30:01 2026 daemon.info dnsmasq[1]: 106330 192.168.1.249/5000 query[A] cdn.example.org from 192.168.1.249
+Mon Sep 28 21:30:01 2026 daemon.info dnsmasq[1]: 106330 192.168.1.249/5000 cached cdn.example.org is <CNAME>
+Mon Sep 28 21:30:01 2026 daemon.info dnsmasq[1]: 106330 192.168.1.249/5000 cached edge.cdnprovider.net is 198.51.100.7
+Mon Sep 28 21:30:01 2026 daemon.info dnsmasq[1]: 106331 192.168.1.249/5001 query[A] 74db6ff77fea4b2e.vercel-dns-016.com from 192.168.1.249
+Mon Sep 28 21:30:01 2026 daemon.info dnsmasq[1]: 106331 192.168.1.249/5001 reply 74db6ff77fea4b2e.vercel-dns-016.com is 216.150.1.1
+Mon Sep 28 21:30:02 2026 daemon.info dnsmasq[2]: query[A] old.example.net from 192.168.1.20
+Mon Sep 28 21:30:02 2026 daemon.info dnsmasq[2]: reply old.example.net is <CNAME>
+Mon Sep 28 21:30:02 2026 daemon.info dnsmasq[2]: reply old.cdn.example is 198.51.100.9
+EOF
+M=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; logread() { cat /tmp/bw-log; }; DIR=/tmp/bw-map; mkdir -p $DIR; : > $DIR/ipmap; update_ipmap; cat $DIR/ipmap')
+# старая карта, где устаревшая привязка стоит последней: свежая должна её перебить
+O=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; logread() { cat /tmp/bw-log; }; DIR=/tmp/bw-map
+    printf "216.150.1.65 www.noodledude.io\n216.150.1.65 74db6ff77fea4b2e.vercel-dns-016.com\n" > $DIR/ipmap
+    rm -f $DIR/ipmap.sum; update_ipmap; domain_of 216.150.1.65')
+# тот же журнал второй раз карту не трогает — слияние пропускается
+P=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; logread() { cat /tmp/bw-log; }; DIR=/tmp/bw-map
+    echo "203.0.113.99 marker.example" >> $DIR/ipmap; update_ipmap; tail -1 $DIR/ipmap')
+rm -rf /tmp/bw-map /tmp/bw-log
+check "CNAME: адрес под именем запроса" sh -c "echo \"\$0\" | grep -qx '216.150.1.65 www.noodledude.io'" "$M"
+check "CNAME: второй адрес тоже" sh -c "echo \"\$0\" | grep -qx '216.150.16.65 www.noodledude.io'" "$M"
+check "служебное имя, спрошенное напрямую, — тоже на сайт" sh -c "echo \"\$0\" | grep -qx '216.150.1.1 www.noodledude.io'" "$M"
+check "служебное имя, спрошенное до цепочки, — тоже на сайт" sh -c "echo \"\$0\" | grep -qx '216.150.99.1 www.noodledude.io'" "$M"
+check "свежая привязка перебивает устаревшую" test "$O" = www.noodledude.io
+check "тот же журнал — без слияния" test "$P" = "203.0.113.99 marker.example"
+check "CNAME: служебного имени нет" sh -c "! echo \"\$0\" | grep -q vercel-dns" "$M"
+check "простой ответ не задет" sh -c "echo \"\$0\" | grep -qx '203.0.113.5 plain.example.com'" "$M"
+check "CNAME из кэша" sh -c "echo \"\$0\" | grep -qx '198.51.100.7 cdn.example.org'" "$M"
+check "журнал без номеров: цепочка по соседним строкам" sh -c "echo \"\$0\" | grep -qx '198.51.100.9 old.example.net'" "$M"
+
+echo "== вердикт на пару «адрес + имя»"
+# probe подменён: сеть в chroot не нужна, важно только, дошло ли до проверки
+CK='. /usr/bin/blockwatch >/dev/null 2>&1
+probe() { echo "$PROBE" >> /tmp/bw-probed; echo "200~ 200~ 200"; }
+now=10000; checked=0; checked_run=0'
+echo "216.150.1.193|74db6ff77fea4b2e.vercel-dns-016.com|живой|0|9000|9000|обход|000~/404/000~" > /tmp/blockwatch/verdicts
+: > /tmp/bw-probed
+sh -c "$CK; PROBE=www; check_one 216.150.1.193 обход www.noodledude.io"
+check "новое имя на проверенном адресе проверяется" grep -qx www /tmp/bw-probed
+check "вердикт нового имени записан" grep -q '^216.150.1.193|www.noodledude.io|ЗАБЛОКИРОВАН|1|' /tmp/blockwatch/verdicts
+check "вердикт соседа по адресу сохранён" grep -q '^216.150.1.193|74db6ff77fea4b2e.vercel-dns-016.com|живой|' /tmp/blockwatch/verdicts
+sh -c "$CK; PROBE=again; check_one 216.150.1.193 обход 74db6ff77fea4b2e.vercel-dns-016.com"
+check "решённая пара ждёт RECHECK" sh -c "! grep -qx again /tmp/bw-probed"
+
+echo "== повторная проверка через 15 минут"
+cat > /tmp/blockwatch/verdicts <<'EOF'
+203.0.113.23|ancient.example.com|лежит|0|5000|5000|нет-ответа|000~/000~/000~
+203.0.113.24|older.example.com|лежит|0|20000|20000|нет-ответа|000~/000~/000~
+216.150.1.1|noodledude.io|лежит|0|28000|28000|нет-ответа|000~/000~/000~
+203.0.113.20|dead.example.com|лежит|0|1000|28000|нет-ответа|000~/000~/000~
+203.0.113.21|half.example.com|ЗАБЛОКИРОВАН|1|28000|28000|обрыв|200~/200~/200
+203.0.113.22|fresh.example.com|лежит|0|29500|29500|нет-ответа|000~/000~/000~
+203.0.113.25|edge.cdn.example|лежит|0|28000|28000|обход|000~/000~/000~
+EOF
+R=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; now=30000; redo_list')
+check "«лежит» один раз — в повтор" sh -c "echo \"\$0\" | grep -qx '216.150.1.1 нет-ответа noodledude.io'" "$R"
+check "«лежит» дважды — не в повтор" sh -c "! echo \"\$0\" | grep -q dead.example.com" "$R"
+check "недоподтверждённое — в повтор" sh -c "echo \"\$0\" | grep -q half.example.com" "$R"
+check "моложе 15 минут — не в повтор" sh -c "! echo \"\$0\" | grep -q fresh.example.com" "$R"
+check "«лежит» из обхода — не в повтор" sh -c "! echo \"\$0\" | grep -q edge.cdn.example" "$R"
+check "«лежит» старше RECHECK — не в повтор" sh -c "! echo \"\$0\" | grep -q ancient.example.com" "$R"
+check "свежие — первыми" test "$(echo "$R" | grep -E 'noodledude|older' | head -1 | cut -d' ' -f3)" = noodledude.io
+: > /tmp/bw-probed
+sh -c "$CK; now=30000; PROBE=down1; check_one 216.150.1.1 нет-ответа noodledude.io"
+check "«лежит» один раз перепроверяется" grep -qx down1 /tmp/bw-probed
+check "после повтора first остался прежним" grep -q '^216.150.1.1|noodledude.io|ЗАБЛОКИРОВАН|1|28000|30000|' /tmp/blockwatch/verdicts
+rm -f /tmp/blockwatch/verdicts /tmp/bw-probed
+
 echo "== после 0.1.0: её «лежит» недостоверны"
 rm -f /etc/blockwatch/verdicts.v
 printf '%s\n' '203.0.113.30|down.example.com|лежит|0|1|1|обход|000~/000~/000~' \
