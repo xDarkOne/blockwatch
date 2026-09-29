@@ -146,6 +146,17 @@ R=$(sh -c "$P; probe 162.159.136.232 discord.example нет-ответа")
 check "нет ответа: соседний адрес ответил — сайт живой" test "$R" = "200 - -"
 check "in_range fakeip" sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; in_range 198.19.3.4 198.18.0.0/15'
 check "in_range чужой" sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; ! in_range 198.20.0.1 198.18.0.0/15'
+check "in_nets: одна из многих" sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; in_nets 172.217.132.74 10.0.0.0/8 172.217.0.0/16 && ! in_nets 151.101.2.132 10.0.0.0/8 172.217.0.0/16'
+# снимок IP-множества: вывод nft как на роутере — подсети, диапазоны, адреса, перенос строк
+SC='. /usr/bin/blockwatch >/dev/null 2>&1; NFT_TABLE=T; NFT_SET=S
+nft() { printf "%s\n" "table inet T {" "	set S {" "		type ipv4_addr" "		flags interval" \
+    "		elements = { 1.0.0.0/24, 8.6.112.0/24," "			     104.16.0.0-104.16.0.255, 149.154.167.50 }" "	}" "}"; }
+set_cache'
+check "снимок: подсеть" sh -c "$SC; in_backend_set 8.6.112.9"
+check "снимок: диапазон" sh -c "$SC; in_backend_set 104.16.0.200"
+check "снимок: одиночный адрес" sh -c "$SC; in_backend_set 149.154.167.50"
+check "снимок: чужой адрес" sh -c "$SC; ! in_backend_set 8.6.113.1 && ! in_backend_set 149.154.167.51"
+rm -f /tmp/blockwatch/set.cache.*
 
 echo "== фильтр обхода"
 # подменные адреса бэкенда и уже проверенные имена отбрасываются; пустой файл
@@ -477,6 +488,12 @@ jq '.route.rule_set = [{"tag": "main-local-domains-ruleset", "type": "local", "f
 blockwatch status > /tmp/s.json 2>/dev/null
 check "подключён к sing-box: wired=true" jq -e '.wired == true' /tmp/s.json
 check "подключён к sing-box: проблемы нет" jq -e '[.problems[] | select(contains("без списка blockwatch"))] | length == 0' /tmp/s.json
+cp /etc/blockwatch/domains.txt /tmp/dom.save 2>/dev/null
+printf '# 2026-09-29 10:00\nlinkmydroid.com\nnotyet.example\n' > /etc/blockwatch/domains.txt
+blockwatch status > /tmp/s.json 2>/dev/null
+check "в туннеле — домен есть в подключённом наборе" jq -e '[.added[] | select(.domain == "linkmydroid.com" and .live and .at == "2026-09-29 10:00")] | length == 1' /tmp/s.json
+check "ещё не применён — домена нет в наборе" jq -e '[.added[] | select(.domain == "notyet.example" and (.live | not))] | length == 1' /tmp/s.json
+mv /tmp/dom.save /etc/blockwatch/domains.txt 2>/dev/null || : > /etc/blockwatch/domains.txt
 jq '.dns.rules = []' /etc/sing-box/config.json > /tmp/sb-config.nodns && cp /tmp/sb-config.nodns /etc/sing-box/config.json
 check "в route есть, в DNS нет — не подключён" sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; ! ruleset_wired'
 cp /tmp/sb-config.orig /etc/sing-box/config.json

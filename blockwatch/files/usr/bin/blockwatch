@@ -764,8 +764,40 @@ listed_due() {   # домены из списка, которым пора на 
 }
 
 in_backend_set() {   # адрес — есть в IP-списке бэкенда (nft сам ищет в диапазонах)
-    [ -n "$NFT_TABLE" ] && [ -n "$NFT_SET" ] &&
-        nft get element inet "$NFT_TABLE" "$NFT_SET" "{ $1 }" >/dev/null 2>&1
+    [ -n "$NFT_TABLE" ] && [ -n "$NFT_SET" ] || return 1
+    if [ -n "$SETCACHE" ] && [ -f "$SETCACHE" ]; then
+        awk -v ip="$1" '
+            function num(a,  p) { split(a, p, "."); return ((p[1] * 256 + p[2]) * 256 + p[3]) * 256 + p[4] }
+            BEGIN { n = num(ip) } $1 <= n && n <= $2 { f = 1; exit } END { exit !f }' "$SETCACHE"
+        return
+    fi
+    nft get element inet "$NFT_TABLE" "$NFT_SET" "{ $1 }" >/dev/null 2>&1
+}
+
+# Снимок IP-множества бэкенда: «от до» числами. Один nft на весь вызов статуса
+# вместо nft get на каждый адрес — по 80 мс, и страница LuCI грузилась 5 с.
+set_cache() {
+    [ -n "$NFT_TABLE" ] && [ -n "$NFT_SET" ] || return 1
+    SETCACHE="$DIR/set.cache.$$"
+    nft list set inet "$NFT_TABLE" "$NFT_SET" 2>/dev/null | awk '
+        function num(a,  p) { split(a, p, "."); return ((p[1] * 256 + p[2]) * 256 + p[3]) * 256 + p[4] }
+        /elements = \{/ { on = 1; sub(/.*elements = \{/, "") }
+        on { last = index($0, "}") > 0; gsub(/[{},]/, " ")
+             for (i = 1; i <= NF; i++) { t = $i
+                 if (t ~ /^[0-9.]+\/[0-9]+$/) { split(t, x, "/"); s = 2 ^ (32 - x[2]); lo = int(num(x[1]) / s) * s; print lo, lo + s - 1 }
+                 else if (t ~ /^[0-9.]+-[0-9.]+$/) { split(t, x, "-"); print num(x[1]), num(x[2]) }
+                 else if (t ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) { v = num(t); print v, v } }
+             if (last) on = 0 }' > "$SETCACHE"
+}
+
+in_nets() {   # адрес сеть... — попадает ли хоть в одну; один awk на все сети
+    _ip=$1; shift
+    awk -v ip="$_ip" -v nets="$*" '
+        function num(a,  p) { split(a, p, "."); return ((p[1] * 256 + p[2]) * 256 + p[3]) * 256 + p[4] }
+        BEGIN { n = num(ip); k = split(nets, a, " ")
+                for (i = 1; i <= k; i++) { split(a[i], x, "/"); s = 2 ^ (32 - (x[2] == "" ? 32 : x[2]))
+                    if (int(n / s) == int(num(x[1]) / s)) exit 0 }
+                exit 1 }'
 }
 
 recheck_listed() {   # одна сетевая проверка за шаг
@@ -953,8 +985,6 @@ ip_ok() {   # адрес — можно ли его добавлять
     _a=$1
     echo "$_a" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || return 1
     case "$_a" in 10.*|127.*|192.168.*|169.254.*|0.*|100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 1 ;; esac
-    in_range "$_a" 172.16.0.0/12 && return 1
-    in_range "$_a" "$FAKEIP_RANGE" && return 1
     grep -qxF "$_a" "$SUBNETS_FILE" 2>/dev/null && return 1
     grep -qxF "$_a" "$DIR/proxy-ips" 2>/dev/null && return 1
     # хоть одно имя с этого адреса из стоп-списка — адрес не трогаем
@@ -962,7 +992,9 @@ ip_ok() {   # адрес — можно ли его добавлять
     # Сети самого Google — и без имени: у безымянного адреса проверять по
     # именам нечего, и дома так в туннель ушли узлы Google Drive
     # (172.217.132.74, 173.194.183.135). Google Cloud сюда не входит: там чужие сайты.
-    for _net in $NEVER_NETS; do in_range "$_a" "$_net" && return 1; done
+    # (а также частные 172.16/12 и подменные адреса бэкенда — одним вызовом)
+    # shellcheck disable=SC2086  # список сетей — через пробел, разбиение нужно
+    in_nets "$_a" 172.16.0.0/12 "$FAKEIP_RANGE" $NEVER_NETS && return 1
     # уже идёт в туннель по какому-то списку бэкенда
     in_backend_set "$_a" && return 1
     return 0
@@ -1057,6 +1089,8 @@ export_ips() {   # [auto] — в том же духе, что export_domains
 
 hooked_section() {
     [ -n "$BACKEND" ] || return 0
+    # статус спрашивает это десятки раз — там секция считается один раз
+    [ -n "$HS_CACHE" ] && { echo "$HS_CACHE"; return; }
     uci show "$BACKEND" 2>/dev/null |
         grep -F "$DOMAINS_FILE" |
         sed -n "s/^$BACKEND\.\([A-Za-z0-9_]*\)\.local_domain_lists=.*/\1/p" |
@@ -1230,6 +1264,10 @@ problems() {   # по строке на проблему
 json_lines() { jq -R -s 'split("\n") | map(select(length > 0))'; }
 
 status_json() {
+    HS_CACHE=$(hooked_section)
+    set_cache
+    # shellcheck disable=SC2064  # имя файла известно сейчас — так и задумано
+    trap "rm -f '$SETCACHE'" EXIT
     mkdir -p "$(dirname "$DOMAINS_FILE")"; touch "$DOMAINS_FILE" 2>/dev/null
     touch "$DIR/verdicts"
     _found=$(awk -F'|' '$3 == "ЗАБЛОКИРОВАН" {
@@ -1240,13 +1278,23 @@ status_json() {
     _pend=$(pending | json_lines)
     _pip=$(pending_ips | json_lines)
     _log=$(tail -100 "$LOG" 2>/dev/null | json_lines | jq -c reverse)
-    _added=$(awk '/^# [0-9][0-9][0-9][0-9]-/ { at = $2 " " $3; next }
-                  /^[[:space:]]*(#|$)/ { next } { print $1, at }' "$DOMAINS_FILE" 2>/dev/null |
-        while read -r d a1 a2; do
-            if via_backend "$d"; then l=true; else l=false; fi
-            printf '%s\t%s %s\t%s\n' "$d" "$a1" "$a2" "$l"
-        done | jq -R -s 'split("\n") | map(select(length > 0) | split("\t") |
-                         { domain: .[0], at: .[1], live: (.[2] == "true") }) | reverse')
+    # «идёт в туннель» = домен есть в живом наборе, а набор подключён к
+    # sing-box. Раньше спрашивали DNS по каждому домену — 38 nslookup и 76 awk
+    # на каждое открытие страницы.
+    _names="$DIR/rs.names.$$"
+    if _rs=$(live_ruleset) && ruleset_wired; then
+        jq -r '.rules[]?.domain_suffix[]?' "$_rs" > "$_names" 2>/dev/null
+    else
+        : > "$_names"
+    fi
+    _added=$(awk -v nf="$_names" '
+            BEGIN { while ((getline l < nf) > 0) inset[tolower(l)] = 1 }
+            /^# [0-9][0-9][0-9][0-9]-/ { at = $2 " " $3; next }
+            /^[[:space:]]*(#|$)/ { next }
+            { printf "%s\t%s\t%s\n", $1, at, (tolower($1) in inset) ? "true" : "false" }' "$DOMAINS_FILE" 2>/dev/null |
+        jq -R -s 'split("\n") | map(select(length > 0) | split("\t") |
+                  { domain: .[0], at: .[1], live: (.[2] == "true") }) | reverse')
+    rm -f "$_names"
     # итог последней перепроверки к каждому домену списка
     touch "$LISTED" 2>/dev/null
     _listed=$(jq -R -s 'split("\n") | map(select(length > 0) | split("|") |
