@@ -233,6 +233,25 @@ blockwatch status > /tmp/s.json 2>/dev/null
 check "status: подключён" jq -e '.hooked == true and .section == "main"' /tmp/s.json
 blockwatch hook main >/dev/null 2>&1
 check "повторный hook не дублирует" test "$(uci -q get netshift.main.local_domain_lists | wc -w)" = 1
+# набор собран, но конфиг sing-box на него не ссылается: так netshift собирает
+# конфиг, когда файл набора пережил очистку при наложившихся перезапусках
+mkdir -p /tmp/sing-box/rulesets
+echo '{"version":3,"rules":[{"domain_suffix":["linkmydroid.com"]}]}' > /tmp/sing-box/rulesets/main-local-domains-ruleset.json
+cp /etc/sing-box/config.json /tmp/sb-config.orig
+blockwatch status > /tmp/s.json 2>/dev/null
+check "не подключён к sing-box: wired=false" jq -e '.wired == false' /tmp/s.json
+check "не подключён к sing-box: есть проблема" jq -e '[.problems[] | select(contains("без списка blockwatch"))] | length == 1' /tmp/s.json
+jq '.route.rule_set = [{"tag": "main-local-domains-ruleset", "type": "local", "format": "source",
+                        "path": "/tmp/sing-box/rulesets/main-local-domains-ruleset.json"}]
+    | .dns.rules = [{"action": "route", "server": "fakeip-server",
+                     "rule_set": ["main-local-domains-ruleset"]}]' /tmp/sb-config.orig > /etc/sing-box/config.json
+blockwatch status > /tmp/s.json 2>/dev/null
+check "подключён к sing-box: wired=true" jq -e '.wired == true' /tmp/s.json
+check "подключён к sing-box: проблемы нет" jq -e '[.problems[] | select(contains("без списка blockwatch"))] | length == 0' /tmp/s.json
+jq '.dns.rules = []' /etc/sing-box/config.json > /tmp/sb-config.nodns && cp /tmp/sb-config.nodns /etc/sing-box/config.json
+check "в route есть, в DNS нет — не подключён" sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; ! ruleset_wired'
+cp /tmp/sb-config.orig /etc/sing-box/config.json
+rm -rf /tmp/sing-box /tmp/sb-config.orig /tmp/sb-config.nodns
 blockwatch unhook >/dev/null 2>&1
 check "unhook убрал путь" sh -c "! uci -q get netshift.main.local_domain_lists"
 

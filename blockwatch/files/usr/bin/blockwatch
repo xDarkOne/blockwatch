@@ -650,6 +650,20 @@ live_ruleset() {
     echo "$_f"
 }
 
+# Подключён ли набор к sing-box: файл набора есть, но конфиг может на него не
+# ссылаться. netshift регистрирует набор в конфиге, только если сам создал файл,
+# а уже существующий пропускает («already exists, skipping»). Если два его
+# перезапуска наложились (wan и wan6 поднялись разом), файл переживает очистку,
+# и конфиг собирается без нашего списка — домены пишутся в набор, но sing-box
+# их не видит. Так было 29.09.2026 на домашнем роутере.
+ruleset_wired() {
+    _s=$(hooked_section); [ -n "$_s" ] || return 1
+    jq -e --arg t "$_s-local-domains-ruleset" '
+        ([.route.rule_set[]?.tag] | index($t) != null) and
+        ([.dns.rules[]? | .rule_set? // empty | if type == "array" then .[] else . end]
+            | index($t) != null)' "$SB_CONFIG" >/dev/null 2>&1
+}
+
 inject_live() {   # домены через перевод строки
     _f=$(live_ruleset) || return 1
     cp -f "$_f" "$_f.bw-bak" 2>/dev/null || return 1
@@ -697,7 +711,11 @@ export_domains() {   # [auto]
 
     _ok=false; _mode=nohook; _msg="записано в файл; файл ещё не подключён к $BACKEND"
     if hooked_up; then
-        if inject_live "$_add"; then
+        if live_ruleset >/dev/null && ! ruleset_wired; then
+            # вписывать бесполезно: sing-box этот набор не читает
+            _mode="unwired"
+            _msg="записано в файл; $BACKEND собрал sing-box без этого списка — перезапусти $BACKEND"
+        elif inject_live "$_add"; then
             _ok=true; _mode=live; _msg="применено на лету, соединения не рвались"
         elif [ "$1" = auto ]; then
             # автоматика бэкенд не перезапускает никогда: домен уже в файле и
@@ -763,6 +781,9 @@ problems() {   # по строке на проблему
     if hooked_up && ! live_ruleset >/dev/null; then
         echo "файл подключён, но $BACKEND ещё не собрал из него список — перезапусти $BACKEND один раз"
     fi
+    if live_ruleset >/dev/null && ! ruleset_wired; then
+        echo "$BACKEND собрал sing-box без списка blockwatch: домены из него сейчас не идут в туннель — перезапусти $BACKEND"
+    fi
     [ "$(uci -q get dhcp.@dnsmasq[0].logqueries)" = 1 ] ||
         echo "выключен журнал запросов dnsmasq — не будет имён сайтов"
     [ "$(cat /proc/sys/net/netfilter/nf_conntrack_acct 2>/dev/null)" = 1 ] ||
@@ -790,6 +811,7 @@ status_json() {
     _counts=$(awk -F'|' '{ n[$3]++ } END { printf "%d %d %d", NR, n["живой"], n["лежит"] }' "$DIR/verdicts")
     set -- $_counts
     if scan_running; then _run=true; else _run=false; fi
+    if live_ruleset >/dev/null && ! ruleset_wired; then _wired=false; else _wired=true; fi
     _apply=$(jq -c . "$DIR/apply.json" 2>/dev/null); [ -n "$_apply" ] || _apply=null
     _tun=null
     if [ -f "$DIR/tunnel" ]; then
@@ -803,9 +825,10 @@ status_json() {
           --argjson found "$_found" --argjson pending "$_pend" --argjson added "$_added" \
           --argjson checked "${1:-0}" --argjson alive "${2:-0}" --argjson down "${3:-0}" \
           --argjson running "$_run" --argjson apply "$_apply" --argjson tunnel "$_tun" \
+          --argjson wired "$_wired" \
           --argjson problems "$(problems | json_lines)" \
           '{version: $version, backend: $backend, file: $file,
-            hooked: ($section != ""), section: $section,
+            hooked: ($section != ""), section: $section, wired: $wired,
             checked: $checked, alive: $alive, down: $down, running: $running,
             tunnel: $tunnel, apply: $apply, problems: $problems,
             added: $added, found: $found, pending: $pending}'

@@ -72,7 +72,8 @@ function addedBlock(st) {
 			cell(a.domain),
 			cell(a.at || '—'),
 			cell(a.live ? 'идёт по правилам ' + backendName(st) :
-				E('span', { 'style': 'color:#c60' },
+				E('span', { 'style': 'color:#c60' }, st.wired === false ?
+					'не идёт: ' + backendName(st) + ' собрал sing-box без списка — перезапусти ' + backendName(st) :
 					'ещё не применён — подхватится при перезапуске ' + backendName(st)))
 		]);
 	}));
