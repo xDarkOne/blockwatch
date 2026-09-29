@@ -32,6 +32,14 @@ function store(key, val) {
 	return null;
 }
 
+// Вставить в узел: пустое пропустить, строку — текстом, массив — по элементам.
+// appendChild принимает только узлы, а блоки тут бывают пустой строкой.
+function put(parent, n) {
+	if (Array.isArray(n)) { n.forEach(function (x) { put(parent, x); }); return; }
+	if (n === '' || n == null || n === false) return;
+	parent.appendChild(typeof n === 'string' || typeof n === 'number' ? document.createTextNode(String(n)) : n);
+}
+
 function backendName(st) {
 	return st.backend === 'podkop' ? 'Podkop' : st.backend === 'netshift' ? 'NetShift' :
 		(st.backend || 'netshift/podkop');
@@ -383,12 +391,12 @@ return view.extend({
 		state.refresh = function () {
 			var s = state.data;
 			head.innerHTML = '';
-			head.appendChild(problemsBlock(s));
-			head.appendChild(tiles(state, s));
+			put(head, problemsBlock(s));
+			put(head, tiles(state, s));
 			Object.keys(RENDER).forEach(function (k) {
 				bodies[k].innerHTML = '';
 				var nodes = RENDER[k](state, s);
-				(Array.isArray(nodes) ? nodes : [nodes]).forEach(function (n) { if (n) bodies[k].appendChild(n); });
+				put(bodies[k], nodes);
 			});
 			drawMenu();
 		};

@@ -25,6 +25,9 @@ jobs:
       - name: JavaScript
         run: node --check luci-app-blockwatch/htdocs/luci-static/resources/view/blockwatch/blockwatch.js
 
+      - name: Вкладка LuCI отрисовывается
+        run: node tests/luci-render.js
+
       - name: JSON
         run: |
           for f in luci-app-blockwatch/root/usr/share/luci/menu.d/*.json \
