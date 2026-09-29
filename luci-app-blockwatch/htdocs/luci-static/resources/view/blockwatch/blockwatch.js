@@ -60,22 +60,26 @@ function cell(content, cls) {
 	return E('td', { 'class': 'td' + (cls ? ' ' + cls : '') }, content);
 }
 
-function table(titles, rows) {
-	return E('table', { 'class': 'table bw-table' }, [
-		E('tr', { 'class': 'tr table-titles' },
-			titles.map(function (t) { return E('th', { 'class': 'th' }, t); }))
-	].concat(rows));
+// Таблица во всю ширину раздела и не шире: доли колонок заданы, длинный
+// текст переносится. Без этого домены и журнал распирали раздел шире
+// интерфейса LuCI, а остальные вкладки были уже.
+function table(titles, rows, widths) {
+	var head = E('tr', { 'class': 'tr table-titles' }, titles.map(function (t, i) {
+		return E('th', { 'class': 'th', 'style': widths && widths[i] ? 'width:' + widths[i] : '' }, t);
+	}));
+	return E('div', { 'class': 'bw-scroll' },
+		E('table', { 'class': 'table bw-table' }, [head].concat(rows)));
 }
 
 // Таблица с поиском и постраничным показом. Поиск и число показанных строк
 // живут в state — перерисовка по таймеру их не сбрасывает.
-function pagedTable(state, key, items, match, titles, row, empty) {
+function pagedTable(state, key, items, match, titles, row, empty, widths) {
 	var q = (state.q[key] || '').toLowerCase();
 	var list = q ? items.filter(function (it) { return match(it).toLowerCase().indexOf(q) >= 0; }) : items;
 	var shown = state.shown[key] || PAGE;
 	if (!list.length)
 		return E('p', { 'class': 'bw-muted' }, q ? 'Ничего не найдено.' : empty);
-	var nodes = [table(titles, list.slice(0, shown).map(row))];
+	var nodes = [table(titles, list.slice(0, shown).map(row), widths)];
 	if (list.length > shown)
 		nodes.push(E('p', {}, E('button', {
 			'class': 'cbi-button',
@@ -160,7 +164,7 @@ function overviewTab(state, st) {
 	var recent = (st.added || []).slice(0, 8).map(function (a) {
 		return E('tr', { 'class': 'tr' }, [cell(a.domain), cell(a.at || '—'), cell(liveBadge(st, a))]);
 	});
-	nodes.push(recent.length ? table(['Сайт', 'Добавлен', 'Сейчас'], recent)
+	nodes.push(recent.length ? table(['Сайт', 'Добавлен', 'Сейчас'], recent, ['50%', '25%', '25%'])
 		: E('p', { 'class': 'bw-muted' }, 'Пока ничего не добавлено.'));
 	return nodes;
 }
@@ -194,7 +198,7 @@ function domainsTab(state, st) {
 			function (a) {
 				return E('tr', { 'class': 'tr' }, [cell(a.domain), cell(a.at || '—'), cell(liveBadge(st, a)),
 					cell(recheckBadge(st, a)), cell(removeButton(state, a.domain), 'bw-right')]);
-			}, 'Пока ничего не добавлено.')
+			}, 'Пока ничего не добавлено.', ['32%', '15%', '17%', '26%', '10%'])
 	];
 }
 
@@ -215,7 +219,7 @@ function ipsTab(state, st) {
 				cell(when(i.at)), cell(when(i.expires)),
 				cell(i.live ? badge('в туннеле', 'green') : badge('ещё не применён', 'orange')),
 				cell(removeButton(state, i.ip), 'bw-right')]);
-		}, 'Пока ни одного адреса.'));
+		}, 'Пока ни одного адреса.', ['15%', '33%', '12%', '12%', '16%', '12%']));
 	return nodes;
 }
 
@@ -252,7 +256,7 @@ function foundTab(state, st) {
 				return E('tr', { 'class': 'tr' }, [
 					cell(f.domain && f.domain !== '-' ? f.domain : E('span', { 'class': 'bw-muted' }, 'имя неизвестно')),
 					cell(E('code', {}, f.ip)), cell(f.why), cell(E('code', {}, f.codes)), cell(foundState(st, f))]);
-			}, 'Находок в работе нет.')
+			}, 'Находок в работе нет.', ['26%', '15%', '13%', '16%', '30%'])
 	];
 }
 
@@ -266,7 +270,7 @@ function logTab(state, st) {
 				var m = l.match(/^(\S+ \S+) (\S+) (.*)$/);
 				return E('tr', { 'class': 'tr' }, [cell(m ? [E('span', { 'class': 'bw-muted' }, m[1] + ' '),
 					badge(m[2], kind(l)), ' ' + m[3]] : l)]);
-			}, 'Журнал пуст.')
+			}, 'Журнал пуст.', ['100%'])
 	];
 }
 
@@ -332,14 +336,19 @@ var CSS = [
 	'.bw-tile-label{opacity:.85}',
 	'.bw-tile-sub{font-size:.85em;opacity:.65;margin-top:.2em}',
 	'.bw-tile-warn{border-left:4px solid #e0a000}.bw-tile-bad{border-left:4px solid #c33}',
-	'.bw-badge{display:inline-block;padding:.05em .5em;border-radius:1em;font-size:.85em;white-space:nowrap}',
+	'.bw-badge{display:inline-block;padding:.05em .5em;border-radius:1em;font-size:.85em;white-space:normal;max-width:100%}',
 	'.bw-green{background:rgba(40,160,70,.18)}.bw-orange{background:rgba(230,150,0,.22)}',
 	'.bw-red{background:rgba(200,50,50,.22);white-space:normal}.bw-blue{background:rgba(50,120,220,.18)}',
 	'.bw-grey{background:rgba(128,128,128,.18);white-space:normal}',
 	'.bw-muted{opacity:.65}.bw-right{text-align:right}',
 	'.bw-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:.8em;margin:.5em 0}',
 	'.bw-search{min-width:16em}.bw-small{padding:.1em .6em!important}',
-	'.bw-tabs{margin-top:.5em}.bw-tabs li{cursor:pointer}'
+	'.bw-tabs{margin-top:.5em}.bw-tabs li{cursor:pointer}',
+	'.bw-scroll{max-width:100%;overflow-x:auto}',
+	'.bw-table{width:100%;table-layout:fixed}',
+	'.bw-table td,.bw-table th{overflow-wrap:anywhere;word-break:break-word;vertical-align:top}',
+	'.bw-table code{white-space:normal;overflow-wrap:anywhere}',
+	'.bw-search{max-width:100%}'
 ].join('\n');
 
 return view.extend({
