@@ -392,12 +392,72 @@ N=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; checked=0; checked_run=0; MAX_
     check_one() { checked=$((checked + 1)); }
     sweep 1; echo $checked')
 check "обход с пределом 1 — одна проверка" test "$N" = 1
+echo "manual.example" >> /etc/blockwatch/domains.txt; echo "203.0.113.77" >> /etc/blockwatch/subnets.txt
+blockwatch remove manual.example > /tmp/rm.out 2>&1
+check "remove: домен убран" sh -c "! grep -qx manual.example /etc/blockwatch/domains.txt"
+check "remove: в журнале «вручную»" grep -q 'УБРАН manual.example вручную' /etc/blockwatch/blockwatch.log
+blockwatch remove 203.0.113.77 > /tmp/rm.out 2>&1
+check "remove: адрес убран" sh -c "! grep -qx 203.0.113.77 /etc/blockwatch/subnets.txt"
+check "remove: чужого нет — ошибка" sh -c "! blockwatch remove nothere.example >/dev/null 2>&1"
 blockwatch status > /tmp/s.json 2>/dev/null
+check "status: адреса, журнал, ожидающие адреса" jq -e '(.ips | type == "array") and (.log | type == "array") and (.pending_ips | type == "array") and (.ips_hooked | type == "boolean")' /tmp/s.json
 check "status: настройки перепроверки" jq -e '.recheck.hours == 72 and .recheck.remove_after == 3 and .recheck.auto_remove == true and (.removed | type == "array")' /tmp/s.json
+
+echo "== адреса: без имени и общие"
+mkdir -p /tmp/blockwatch
+cp /tmp/blockwatch/ipmap /tmp/bw-ipmap.save 2>/dev/null
+printf '%s\n' '8.6.112.6 eshop-prices.com' '8.6.112.6 checkonline.home-assistant.io' '8.6.112.6 api.ipify.org' \
+    '203.0.113.90 one.example' '142.250.1.1 www.youtube.com' '142.250.1.1 other.example' \
+    '198.51.100.20 site.ru' '198.51.100.20 x.example' > /tmp/blockwatch/ipmap
+N=$(date +%s)
+cat > /tmp/blockwatch/verdicts <<EOF
+8.6.112.6|checkonline.home-assistant.io|ЗАБЛОКИРОВАН|2|1|$N|обрыв|-/200~/200
+203.0.113.90|one.example|ЗАБЛОКИРОВАН|2|1|$N|обрыв|-/200~/200
+203.0.113.91|-|ЗАБЛОКИРОВАН|2|1|$N|молчит|000~/000~/200
+203.0.113.92|-|ЗАБЛОКИРОВАН|1|1|$N|молчит|000~/000~/200
+142.250.1.1|other.example|ЗАБЛОКИРОВАН|2|1|$N|обрыв|-/200~/200
+198.51.100.20|x.example|ЗАБЛОКИРОВАН|2|1|$N|обрыв|-/200~/200
+10.0.0.5|-|ЗАБЛОКИРОВАН|2|1|$N|молчит|000~/000~/200
+EOF
+IPS='. /usr/bin/blockwatch >/dev/null 2>&1; SUBNETS_FILE=/tmp/bw-sub.txt; SUBNETS_META=/tmp/bw-sub.meta
+DOMAINS_FILE=/tmp/bw-dom2.txt; LOG=/tmp/bw-iplog; in_backend_set() { return 1; }; via_backend() { return 1; }
+proxy_ips() { echo 203.0.113.99; }'
+rm -f /tmp/bw-sub.txt /tmp/bw-sub.meta /tmp/bw-dom2.txt /tmp/bw-iplog
+check "общий адрес — три имени — общий" sh -c "$IPS; shared_ips | grep -qx 8.6.112.6"
+PD=$(sh -c "$IPS; pending" | tr '\n' ' ')
+check "общий адрес по признаку: имя-догадку не добавлять" sh -c "! echo \"\$0\" | grep -q checkonline" "$PD"
+check "свой адрес у сайта — добавляется домен" sh -c "echo \"\$0\" | grep -q one.example" "$PD"
+PI=$(sh -c "$IPS; pending_ips" | tr '\n' ' ')
+check "общий адрес — в адреса" sh -c "echo \"\$0\" | grep -q 8.6.112.6" "$PI"
+check "без имени — в адреса" sh -c "echo \"\$0\" | grep -q 203.0.113.91" "$PI"
+check "без имени, 1 из 2 — ещё нет" sh -c "! echo \"\$0\" | grep -q 203.0.113.92" "$PI"
+check "свой адрес у сайта — не в адреса" sh -c "! echo \"\$0\" | grep -q 203.0.113.90" "$PI"
+check "адрес с YouTube — никогда" sh -c "! echo \"\$0\" | grep -q 142.250.1.1" "$PI"
+check "адрес с .ru — никогда" sh -c "! echo \"\$0\" | grep -q 198.51.100.20" "$PI"
+check "частный адрес — никогда" sh -c "! echo \"\$0\" | grep -q 10.0.0.5" "$PI"
+check "сеть Google без имени — никогда" sh -c ". /usr/bin/blockwatch >/dev/null 2>&1; SUBNETS_FILE=/tmp/bw-none; in_backend_set() { return 1; }; build_never; : > /tmp/blockwatch/proxy-ips; ! ip_ok 172.217.132.74 && ! ip_ok 173.194.183.135 && ip_ok 151.101.2.132"
+sh -c "$IPS; inject_ips() { echo \"\$1\" > /tmp/bw-injected; return 0; }; export_ips auto"
+check "добавлен в файл адресов" sh -c "grep -qx 8.6.112.6 /tmp/bw-sub.txt && grep -qx 203.0.113.91 /tmp/bw-sub.txt"
+check "…и в метаданные с именами" grep -q '^8.6.112.6|[0-9]*|api.ipify.org,checkonline.home-assistant.io,eshop-prices.com$' /tmp/bw-sub.meta
+check "…и вписан на лету" grep -qx 8.6.112.6 /tmp/bw-injected
+check "…и в журнал" grep -q 'ДОБАВЛЕН-АДРЕС 8.6.112.6' /tmp/bw-iplog
+check "повторно не добавляется" sh -c ". /usr/bin/blockwatch >/dev/null 2>&1; SUBNETS_FILE=/tmp/bw-sub.txt; in_backend_set() { return 1; }; proxy_ips() { :; }; build_never; : > /tmp/blockwatch/proxy-ips; ! ip_ok 8.6.112.6"
+check "адрес прокси-сервера — никогда" sh -c ". /usr/bin/blockwatch >/dev/null 2>&1; SUBNETS_FILE=/tmp/bw-sub.txt; in_backend_set() { return 1; }; build_never; echo 203.0.113.99 > /tmp/blockwatch/proxy-ips; ! ip_ok 203.0.113.99"
+# срок жизни
+awk -F'|' -v OFS='|' '$1 == "203.0.113.91" { $2 = 1 } { print }' /tmp/bw-sub.meta > /tmp/bw-sub.m2 && mv /tmp/bw-sub.m2 /tmp/bw-sub.meta
+sh -c "$IPS; live_subnet_ruleset() { return 1; }; nft() { :; }; now=\$(date +%s); expire_ips"
+check "истёкший адрес убран из файла" sh -c "! grep -qx 203.0.113.91 /tmp/bw-sub.txt"
+check "…и из метаданных" sh -c "! grep -q '^203.0.113.91|' /tmp/bw-sub.meta"
+check "…и из вердиктов — найдётся заново" sh -c "! grep -q '^203.0.113.91|' /tmp/blockwatch/verdicts"
+check "…и записан в журнал" grep -q 'ИСТЁК-АДРЕС 203.0.113.91' /tmp/bw-iplog
+check "свежий адрес остался" grep -qx 8.6.112.6 /tmp/bw-sub.txt
+rm -f /tmp/bw-sub.txt /tmp/bw-sub.meta /tmp/bw-dom2.txt /tmp/bw-iplog /tmp/bw-injected /tmp/blockwatch/verdicts /tmp/blockwatch/state.dirty
+mv /tmp/bw-ipmap.save /tmp/blockwatch/ipmap 2>/dev/null || rm -f /tmp/blockwatch/ipmap
 
 echo "== hook / unhook"
 blockwatch hook main >/dev/null 2>&1
 check "hook добавил путь" sh -c "uci -q get netshift.main.local_domain_lists | grep -q /etc/blockwatch/domains.txt"
+check "hook добавил и список адресов" sh -c "uci -q get netshift.main.local_subnet_lists | grep -q /etc/blockwatch/subnets.txt"
 blockwatch status > /tmp/s.json 2>/dev/null
 check "status: подключён" jq -e '.hooked == true and .section == "main"' /tmp/s.json
 blockwatch hook main >/dev/null 2>&1
@@ -423,6 +483,7 @@ cp /tmp/sb-config.orig /etc/sing-box/config.json
 rm -rf /tmp/sing-box /tmp/sb-config.orig /tmp/sb-config.nodns
 blockwatch unhook >/dev/null 2>&1
 check "unhook убрал путь" sh -c "! uci -q get netshift.main.local_domain_lists"
+check "unhook убрал и список адресов" sh -c "! uci -q get netshift.main.local_subnet_lists"
 
 echo "== podkop"
 fake_backend podkop PodkopTable podkop_subnets

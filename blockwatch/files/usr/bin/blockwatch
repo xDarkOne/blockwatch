@@ -56,6 +56,17 @@ now=$(date +%s)
 cfg() { _v=$(uci -q get "$CONFIG.main.$1"); echo "${_v:-$2}"; }
 
 DOMAINS_FILE=$(cfg domains_file /etc/blockwatch/domains.txt)
+# Адреса — для случаев, когда имя не помогает: адрес без имени или общий адрес
+# CDN, на котором сотни сайтов (дома 8.6.112.6 Cloudflare: eshop-prices.com,
+# Home Assistant, ipify — blockwatch брал последнее имя из DNS и проверял не
+# тот сайт). Файл подключается в netshift/podkop как Local Subnet List.
+SUBNETS_FILE=$(cfg subnets_file /etc/blockwatch/subnets.txt)
+SUBNETS_META=/etc/blockwatch/subnets.meta   # «адрес|когда добавлен|имена»
+MAX_SUBNETS=$(cfg max_subnets 200)
+# Адрес из списка не перепроверить напрямую — трафик к нему уже в туннеле,
+# и с самого роутера тоже. Поэтому у адресов срок жизни: потом адрес
+# возвращается на прямую и, если его всё ещё режут, находится заново.
+IP_TTL=$(($(cfg ip_ttl_days 30) * 86400))
 AUTO_EXPORT=$(cfg auto_export 1)
 MAX_DAY=$(cfg max_per_day 30)
 # Предел списка: на тесных роутерах свободно ~1,5 МБ флеша, а список и
@@ -162,6 +173,34 @@ build_never() {
     for _s in $_list; do
         _e=$(printf '%s' "$_s" | sed 's/\./\\./g')
         NEVER="${NEVER:+$NEVER|}(^|\\.)$_e\$"
+    done
+    # Для адресов — строже: адрес захватывает все сайты на нём. Адреса Google и
+    # YouTube не трогаем: YouTube у многих нарочно идёт через zapret, и завернуть
+    # его адрес в туннель значило бы молча переопределить это решение.
+    _ipl=$(uci -q get "$CONFIG.main.never_ip_suffix")
+    [ -n "$_ipl" ] || _ipl="google.com googleapis.com gstatic.com googleusercontent.com ggpht.com youtube.com ytimg.com youtu.be"
+    NEVER_IP=$NEVER
+    for _s in $_ipl; do
+        _e=$(printf '%s' "$_s" | sed 's/\./\\./g')
+        NEVER_IP="${NEVER_IP:+$NEVER_IP|}(^|\\.)$_e\$"
+    done
+}
+
+# Собственные сети Google (goog.json без Google Cloud) — для адресов без имени.
+NEVER_NETS=$(uci -q get "$CONFIG.main.never_ip_net")
+[ -n "$NEVER_NETS" ] || NEVER_NETS="8.8.4.0/24 8.8.8.0/24 8.34.208.0/20 8.35.192.0/20 23.236.48.0/20
+    23.251.128.0/19 64.233.160.0/19 66.102.0.0/20 66.249.64.0/19 70.32.128.0/19 72.14.192.0/18
+    74.125.0.0/16 104.154.0.0/15 108.177.0.0/17 142.250.0.0/15 172.217.0.0/16 172.253.0.0/16
+    173.194.0.0/16 192.178.0.0/15 199.36.154.0/23 199.36.156.0/24 207.223.160.0/20 208.65.152.0/22
+    208.68.108.0/22 208.81.188.0/22 208.117.224.0/19 209.85.128.0/17 216.58.192.0/19 216.239.32.0/19"
+
+# адреса самих прокси-серверов: и записанные адресом, и по имени
+proxy_ips() {
+    for _h in $(proxy_servers); do
+        case "$_h" in
+            *[!0-9.]*) dns_a "$_h" "$DIRECT_DNS" ;;
+            *) echo "$_h" ;;
+        esac
     done
 }
 
@@ -510,6 +549,7 @@ scan() {
     touch "$DIR/ipmap" "$DIR/silent" "$DIR/verdicts" "$DIR/flows"
     [ -s "$DIR/verdicts" ] || { [ -s "$STATE" ] && cp -f "$STATE" "$DIR/verdicts"; }
     forget_stale_verdicts
+    expire_ips
 
     if [ -z "$BACKEND" ]; then
         logger -t blockwatch "не найден netshift/podkop — заход пропущен"
@@ -588,6 +628,7 @@ scan() {
         [ "$checked" -eq 0 ] && sweep
 
         [ "$AUTO_EXPORT" = 1 ] && export_domains auto >/dev/null 2>&1
+        [ "$AUTO_EXPORT" = 1 ] && export_ips auto >/dev/null 2>&1
     fi
 
     [ "$(date +%s)" -ge "$deadline" ] && break
@@ -760,7 +801,8 @@ recheck_one() {   # домен
 
 remove_domain() {   # домен коды — убрать из файла, из живого набора и из памяти
     _d=$1
-    grep -vxF "$_d" "$DOMAINS_FILE" > "$DOMAINS_FILE.tmp" && mv "$DOMAINS_FILE.tmp" "$DOMAINS_FILE"
+    # grep -v без единой оставшейся строки завершается с 1 — не повод не убирать
+    { grep -vxF "$_d" "$DOMAINS_FILE" || true; } > "$DOMAINS_FILE.tmp" && mv "$DOMAINS_FILE.tmp" "$DOMAINS_FILE"
     if _f=$(live_ruleset); then
         if jq --arg d "$_d" '.rules |= map(if .domain_suffix then .domain_suffix -= [$d] else . end)' \
                "$_f" > "$_f.bw-new" 2>/dev/null && jq -e . "$_f.bw-new" >/dev/null 2>&1; then
@@ -773,7 +815,7 @@ remove_domain() {   # домен коды — убрать из файла, из
     # не вернулся бы к нему никогда — вернётся блокировка, найдём заново
     awk -F'|' -v d="$_d" '$2 != d' "$DIR/verdicts" > "$DIR/v.tmp" 2>/dev/null && mv "$DIR/v.tmp" "$DIR/verdicts"
     awk -F'|' -v d="$_d" '$1 != d' "$LISTED" > "$LISTED.tmp" 2>/dev/null && mv "$LISTED.tmp" "$LISTED"
-    log_find "УБРАН $_d открывается напрямую $REMOVE_AFTER раза подряд, коды=$2"
+    log_find "УБРАН $_d ${3:-открывается напрямую $REMOVE_AFTER раза подряд, коды=$2}"
     logger -t blockwatch "убран из списка: $_d — снова открывается напрямую"
     touch "$DIR/state.dirty"
 }
@@ -869,11 +911,22 @@ sweep() {   # [сколько проверок, по умолчанию скол
 }
 
 # --- связь с бэкендом: файл доменов -----------------------------------------
+# Общий адрес: в журнале DNS на нём больше одного имени (CDN, Cloudflare).
+shared_ips() {
+    awk '!s[$0]++ { n[$1]++ } END { for (k in n) if (n[k] >= 2) print k }' "$DIR/ipmap" 2>/dev/null
+}
+
+# Находка «на уровне адреса»: вердикт вынесен по адресу (сайт целиком не
+# проверялся — «-» в кодах), а адрес общий или имени нет вовсе. Тогда имя —
+# лишь последнее из журнала DNS, может быть чужим, и добавлять надо адрес.
 pending() {
     [ -f "$DIR/verdicts" ] || return 0
     [ -n "$NEVER" ] || build_never
-    awk -F'|' -v now="$(date +%s)" \
-        '$3 == "ЗАБЛОКИРОВАН" && $4 + 0 >= 2 && $2 != "-" && now - $6 < 86400 { print $2 }' \
+    shared_ips > "$DIR/shared" 2>/dev/null
+    awk -F'|' -v now="$(date +%s)" -v sf="$DIR/shared" '
+        BEGIN { while ((getline l < sf) > 0) sh[l] = 1 }
+        $3 == "ЗАБЛОКИРОВАН" && $4 + 0 >= 2 && $2 != "-" && now - $6 < 86400 &&
+        !($8 ~ /^-\// && ($1 in sh)) { print $2 }' \
         "$DIR/verdicts" | sort -u | grep -vEi "$NEVER" |
         while read -r d; do
             grep -qxiF "$d" "$DOMAINS_FILE" 2>/dev/null && continue
@@ -881,6 +934,125 @@ pending() {
             via_backend "$d" && continue
             echo "$d"
         done
+}
+
+pending_ips() {
+    [ -f "$DIR/verdicts" ] || return 0
+    [ -n "$NEVER_IP" ] || build_never
+    shared_ips > "$DIR/shared" 2>/dev/null
+    proxy_ips > "$DIR/proxy-ips" 2>/dev/null
+    awk -F'|' -v now="$(date +%s)" -v sf="$DIR/shared" '
+        BEGIN { while ((getline l < sf) > 0) sh[l] = 1 }
+        $3 == "ЗАБЛОКИРОВАН" && $4 + 0 >= 2 && now - $6 < 86400 &&
+        ($2 == "-" || ($8 ~ /^-\// && ($1 in sh))) { print $1 }' \
+        "$DIR/verdicts" | sort -u |
+        while read -r _a; do ip_ok "$_a" && echo "$_a"; done
+}
+
+ip_ok() {   # адрес — можно ли его добавлять
+    _a=$1
+    echo "$_a" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || return 1
+    case "$_a" in 10.*|127.*|192.168.*|169.254.*|0.*|100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 1 ;; esac
+    in_range "$_a" 172.16.0.0/12 && return 1
+    in_range "$_a" "$FAKEIP_RANGE" && return 1
+    grep -qxF "$_a" "$SUBNETS_FILE" 2>/dev/null && return 1
+    grep -qxF "$_a" "$DIR/proxy-ips" 2>/dev/null && return 1
+    # хоть одно имя с этого адреса из стоп-списка — адрес не трогаем
+    grep "^$_a " "$DIR/ipmap" 2>/dev/null | awk '{ print $2 }' | grep -qEi "$NEVER_IP" && return 1
+    # Сети самого Google — и без имени: у безымянного адреса проверять по
+    # именам нечего, и дома так в туннель ушли узлы Google Drive
+    # (172.217.132.74, 173.194.183.135). Google Cloud сюда не входит: там чужие сайты.
+    for _net in $NEVER_NETS; do in_range "$_a" "$_net" && return 1; done
+    # уже идёт в туннель по какому-то списку бэкенда
+    in_backend_set "$_a" && return 1
+    return 0
+}
+
+subnets_hooked() {
+    [ -n "$BACKEND" ] && uci show "$BACKEND" 2>/dev/null | grep -F "$SUBNETS_FILE" | grep -q 'local_subnet_lists='
+}
+
+live_subnet_ruleset() {
+    _s=$(hooked_section); [ -n "$_s" ] || return 1
+    _f="$RULESET_DIR/$_s-local-subnets-ruleset.json"
+    [ -f "$_f" ] || return 1
+    echo "$_f"
+}
+
+subnets_wired() {
+    _s=$(hooked_section); [ -n "$_s" ] || return 1
+    jq -e --arg t "$_s-local-subnets-ruleset" '[.route.rule_set[]?.tag] | index($t) != null' \
+        "$SB_CONFIG" >/dev/null 2>&1
+}
+
+# Адреса на лету: в набор sing-box (он перечитывает его сам) и в nft-множество
+# бэкенда — иначе трафик к адресу не попал бы в sing-box вовсе.
+inject_ips() {   # адреса через перевод строки
+    _f=$(live_subnet_ruleset) || return 1
+    subnets_wired || return 1
+    _arr=$(echo "$1" | jq -R -s 'split("\n") | map(select(length > 0))')
+    if jq --argjson add "$_arr" '
+           if ((.rules // []) | length) == 0 then .rules = [{ ip_cidr: $add }]
+           else .rules[0].ip_cidr = (((.rules[0].ip_cidr // []) + $add) | unique) end
+       ' "$_f" > "$_f.bw-new" 2>/dev/null && jq -e . "$_f.bw-new" >/dev/null 2>&1; then
+        mv "$_f.bw-new" "$_f"
+    else
+        rm -f "$_f.bw-new"; return 1
+    fi
+    for _a in $1; do nft add element inet "$NFT_TABLE" "$NFT_SET" "{ $_a }" 2>/dev/null; done
+    in_backend_set "$(echo "$1" | head -1)"
+}
+
+drop_ip() {   # адрес — убрать отовсюду
+    _a=$1
+    { grep -vxF "$_a" "$SUBNETS_FILE" 2>/dev/null || true; } > "$SUBNETS_FILE.tmp" && mv "$SUBNETS_FILE.tmp" "$SUBNETS_FILE"
+    awk -F'|' -v a="$_a" '$1 != a' "$SUBNETS_META" > "$SUBNETS_META.tmp" 2>/dev/null &&
+        mv "$SUBNETS_META.tmp" "$SUBNETS_META"
+    if _f=$(live_subnet_ruleset); then
+        if jq --arg a "$_a" '.rules |= map(if .ip_cidr then .ip_cidr -= [$a] else . end)' \
+               "$_f" > "$_f.bw-new" 2>/dev/null && jq -e . "$_f.bw-new" >/dev/null 2>&1; then
+            mv "$_f.bw-new" "$_f"
+        else
+            rm -f "$_f.bw-new"
+        fi
+    fi
+    nft delete element inet "$NFT_TABLE" "$NFT_SET" "{ $_a }" 2>/dev/null
+    # и вердикты: вернётся блокировка — найдём заново, а не будем ждать 6 часов
+    awk -F'|' -v a="$_a" '$1 != a' "$DIR/verdicts" > "$DIR/v.tmp" 2>/dev/null && mv "$DIR/v.tmp" "$DIR/verdicts"
+}
+
+expire_ips() {   # срок жизни адресов (IP_TTL)
+    [ -s "$SUBNETS_META" ] || return 0
+    awk -F'|' -v now="$now" -v ttl="$IP_TTL" 'now - $2 >= ttl { print $1 }' "$SUBNETS_META" |
+        while read -r _a; do
+            drop_ip "$_a"
+            log_find "ИСТЁК-АДРЕС $_a — срок $((IP_TTL / 86400)) дн., снова на прямую"
+        done
+}
+
+export_ips() {   # [auto] — в том же духе, что export_domains
+    touch "$SUBNETS_FILE" "$SUBNETS_META" 2>/dev/null
+    _n=$(grep -cE '^[0-9]' "$SUBNETS_FILE" 2>/dev/null); _n=${_n:-0}
+    _room=$((MAX_SUBNETS - _n)); [ "$_room" -gt "$MAX_EXPORT" ] && _room=$MAX_EXPORT
+    _today=$(grep -c "^$(date '+%Y-%m-%d') .*ДОБАВЛЕН" "$LOG" 2>/dev/null); _today=${_today:-0}
+    [ $((MAX_DAY - _today)) -lt "$_room" ] && _room=$((MAX_DAY - _today))
+    [ "$_room" -le 0 ] && return 0
+    _addip=$(pending_ips | head -"$_room")
+    [ -n "$_addip" ] || return 0
+    {
+        [ -s "$SUBNETS_FILE" ] || echo "# Адреса, которые blockwatch нашёл заблокированными: без имени или общие (CDN)."
+        echo "# $(date '+%Y-%m-%d %H:%M')"
+        echo "$_addip"
+    } >> "$SUBNETS_FILE"
+    for _a in $_addip; do
+        _names=$(grep "^$_a " "$DIR/ipmap" 2>/dev/null | awk '{ print $2 }' | sort -u | head -5 | tr '\n' ',' | sed 's/,$//')
+        echo "$_a|$(date +%s)|${_names:--}" >> "$SUBNETS_META"
+        log_find "ДОБАВЛЕН-АДРЕС $_a имена=${_names:--}"
+    done
+    logger -t blockwatch "добавлены адреса: $(echo $_addip)"
+    if inject_ips "$_addip"; then _m="адреса применены на лету"
+    else _m="адреса записаны в файл; применятся, когда $BACKEND соберёт список адресов"; fi
+    jq -n --arg t "$(date '+%H:%M')" --arg m "$_m" '{state: "live", at: $t, message: $m}' > "$DIR/apply.json"
 }
 
 hooked_section() {
@@ -1044,6 +1216,11 @@ problems() {   # по строке на проблему
     if live_ruleset >/dev/null && ! ruleset_wired; then
         echo "$BACKEND собрал sing-box без списка blockwatch: домены из него сейчас не идут в туннель — перезапусти $BACKEND"
     fi
+    if hooked_up && ! subnets_hooked; then
+        echo "список адресов $SUBNETS_FILE не подключён: blockwatch hook (перезапустит $BACKEND один раз)"
+    elif subnets_hooked && ! subnets_wired; then
+        echo "список адресов подключён, но $BACKEND ещё не собрал его в sing-box — перезапусти $BACKEND"
+    fi
     [ "$(uci -q get dhcp.@dnsmasq[0].logqueries)" = 1 ] ||
         echo "выключен журнал запросов dnsmasq — не будет имён сайтов"
     [ "$(cat /proc/sys/net/netfilter/nf_conntrack_acct 2>/dev/null)" = 1 ] ||
@@ -1061,6 +1238,8 @@ status_json() {
                        { ip: .[0], domain: .[1], confirmed: ((.[2] | tonumber) >= 2),
                          why: .[3], codes: .[4] })')
     _pend=$(pending | json_lines)
+    _pip=$(pending_ips | json_lines)
+    _log=$(tail -100 "$LOG" 2>/dev/null | json_lines | jq -c reverse)
     _added=$(awk '/^# [0-9][0-9][0-9][0-9]-/ { at = $2 " " $3; next }
                   /^[[:space:]]*(#|$)/ { next } { print $1, at }' "$DOMAINS_FILE" 2>/dev/null |
         while read -r d a1 a2; do
@@ -1078,6 +1257,15 @@ status_json() {
     _removed=$(grep ' УБРАН ' "$LOG" 2>/dev/null | tail -20 |
         awk '{ print $1 " " $2 "\t" $4 }' | jq -R -s 'split("\n") | map(select(length > 0) |
             split("\t") | { at: .[0], domain: .[1] }) | reverse')
+    # адреса: «адрес|когда|имена», идёт ли сейчас в туннель, когда истекает
+    touch "$SUBNETS_META" 2>/dev/null
+    _ips=$(while IFS='|' read -r _a _t _nm; do
+               [ -n "$_a" ] || continue
+               if in_backend_set "$_a"; then _l=true; else _l=false; fi
+               printf '%s\t%s\t%s\t%s\n' "$_a" "$_t" "$_nm" "$_l"
+           done < "$SUBNETS_META" | jq -R -s --argjson ttl "$IP_TTL" 'split("\n") | map(select(length > 0) |
+               split("\t") | { ip: .[0], at: (.[1] | tonumber), names: .[2], live: (.[3] == "true"),
+                               expires: ((.[1] | tonumber) + $ttl) }) | reverse')
     _counts=$(awk -F'|' '{ n[$3]++ } END { printf "%d %d %d", NR, n["живой"], n["лежит"] }' "$DIR/verdicts")
     set -- $_counts
     if scan_running; then _run=true; else _run=false; fi
@@ -1095,7 +1283,8 @@ status_json() {
           --argjson found "$_found" --argjson pending "$_pend" --argjson added "$_added" \
           --argjson checked "${1:-0}" --argjson alive "${2:-0}" --argjson down "${3:-0}" \
           --argjson running "$_run" --argjson apply "$_apply" --argjson tunnel "$_tun" \
-          --argjson wired "$_wired" --argjson removed "$_removed" \
+          --argjson wired "$_wired" --argjson removed "$_removed" --argjson ips "$_ips" --argjson pending_ips "$_pip" --argjson log "$_log" \
+          --argjson ips_hooked "$(subnets_hooked && echo true || echo false)" \
           --argjson recheck "{\"auto_remove\": $([ "$AUTO_REMOVE" = 1 ] && echo true || echo false), \"hours\": $((RECHECK_LISTED / 3600)), \"remove_after\": $REMOVE_AFTER}" \
           --argjson problems "$(problems | json_lines)" \
           '{version: $version, backend: $backend, file: $file,
@@ -1103,7 +1292,7 @@ status_json() {
             checked: $checked, alive: $alive, down: $down, running: $running,
             tunnel: $tunnel, apply: $apply, problems: $problems,
             added: $added, found: $found, pending: $pending,
-            removed: $removed, recheck: $recheck}'
+            removed: $removed, recheck: $recheck, ips: $ips, ips_hooked: $ips_hooked, pending_ips: $pending_ips, log: $log}'
 }
 
 report() {
@@ -1211,13 +1400,18 @@ hook() {   # секция
     [ -n "$BACKEND" ] || { echo "не найден netshift или podkop"; return 1; }
     _sec=${1:-main}
     uci -q get "$BACKEND.$_sec" >/dev/null || { echo "нет секции $BACKEND.$_sec"; return 1; }
-    if [ -n "$(hooked_section)" ]; then
-        echo "уже подключён: секция $(hooked_section)"
+    _cur=$(hooked_section)
+    if [ -n "$_cur" ] && subnets_hooked; then
+        echo "уже подключён: секция $_cur"
         return 0
     fi
-    touch "$DOMAINS_FILE"
-    uci add_list "$BACKEND.$_sec.local_domain_lists=$DOMAINS_FILE" && uci commit "$BACKEND"
-    echo "подключён к $BACKEND.$_sec; $BACKEND перезапускается один раз, чтобы собрать список"
+    # список адресов подключается в ту же секцию, что и список доменов
+    [ -n "$_cur" ] && _sec=$_cur
+    touch "$DOMAINS_FILE" "$SUBNETS_FILE"
+    [ -n "$_cur" ] || uci add_list "$BACKEND.$_sec.local_domain_lists=$DOMAINS_FILE"
+    subnets_hooked || uci add_list "$BACKEND.$_sec.local_subnet_lists=$SUBNETS_FILE"
+    uci commit "$BACKEND"
+    echo "подключён к $BACKEND.$_sec; $BACKEND перезапускается один раз, чтобы собрать списки"
     ( trap "" HUP; /usr/bin/blockwatch apply-bg >/dev/null 2>&1 & ) </dev/null
 }
 
@@ -1227,6 +1421,10 @@ unhook() {
                   sed -n "s/^$BACKEND\.\([A-Za-z0-9_]*\)\.local_domain_lists=.*/\1/p"); do
         uci del_list "$BACKEND.$_sec.local_domain_lists=$DOMAINS_FILE"
         echo "отключён от $BACKEND.$_sec (подействует после перезапуска $BACKEND)"
+    done
+    for _sec in $(uci show "$BACKEND" 2>/dev/null | grep -F "$SUBNETS_FILE" |
+                  sed -n "s/^$BACKEND\.\([A-Za-z0-9_]*\)\.local_subnet_lists=.*/\1/p"); do
+        uci del_list "$BACKEND.$_sec.local_subnet_lists=$SUBNETS_FILE"
     done
     uci commit "$BACKEND"
 }
@@ -1281,6 +1479,17 @@ case "$1" in
     cron-on)   cron_on ;;
     cron-off)  cron_off ;;
     version)   echo "$VERSION" ;;
+    remove)    # домен или адрес — убрать вручную (кнопка на вкладке)
+        [ -n "$2" ] || { echo "укажи домен или адрес"; exit 1; }
+        if echo "$2" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+            grep -qxF "$2" "$SUBNETS_FILE" 2>/dev/null || { echo "адреса $2 нет в списке"; exit 1; }
+            drop_ip "$2"; log_find "УБРАН $2 вручную"
+        else
+            grep -qxiF "$2" "$DOMAINS_FILE" 2>/dev/null || { echo "домена $2 нет в списке"; exit 1; }
+            remove_domain "$2" - "вручную"
+        fi
+        touch "$DIR/state.dirty"; save_state; echo "убран: $2"
+        ;;
     *)
         cat <<EOF
 blockwatch $VERSION — наблюдатель за блокировками для netshift/podkop

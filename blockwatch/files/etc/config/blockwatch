@@ -23,6 +23,16 @@ config blockwatch 'main'
 	# появляется предупреждение. Место освобождает только перепроверка.
 	option max_domains '500'
 
+	# Адреса — когда имя неизвестно или адрес общий (Cloudflare, CDN). Файл
+	# подключается как Local Subnet List. Проверить адрес напрямую после
+	# добавления нельзя, поэтому у него срок жизни.
+	option subnets_file '/etc/blockwatch/subnets.txt'
+	option max_subnets '200'
+	option ip_ttl_days '30'
+	# Адреса с этими именами не добавляются никогда (вдобавок к never_suffix):
+	# YouTube у многих нарочно идёт через zapret.
+	#list never_ip_suffix 'youtube.com'
+
 	# Перепроверка списка: раз в recheck_hours каждый домен открывается
 	# напрямую (после удачи — через сутки). Открылся напрямую remove_after раз
 	# подряд — убирается из списка (если auto_remove '1').
