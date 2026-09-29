@@ -2,10 +2,12 @@
 'require view';
 'require fs';
 'require poll';
+'require form';
 
-// Вкладка blockwatch — только посмотреть. Всё делается само: подтверждённые
-// блокировки дописываются в файл, который netshift/podkop читают как Local
-// Domain List, а sing-box подхватывает изменения на лету.
+// Вкладка blockwatch. Всё делается само: подтверждённые блокировки
+// дописываются в файл, который netshift/podkop читают как Local Domain List,
+// sing-box подхватывает изменения на лету, а перепроверка убирает то, что
+// снова открывается напрямую. Здесь — смотреть и настраивать.
 
 function call(args) {
 	return fs.exec('/usr/bin/blockwatch', args).then(function (res) {
@@ -67,16 +69,94 @@ function addedBlock(st) {
 	if (!added.length)
 		return E('p', {}, 'Пока ничего не добавлено.');
 
-	return table(['Сайт', 'Добавлен', 'Сейчас'], added.map(function (a) {
+	return table(['Сайт', 'Добавлен', 'Сейчас', 'Перепроверка'], added.map(function (a) {
 		return E('tr', { 'class': 'tr' }, [
 			cell(a.domain),
 			cell(a.at || '—'),
 			cell(a.live ? 'идёт по правилам ' + backendName(st) :
 				E('span', { 'style': 'color:#c60' }, st.wired === false ?
 					'не идёт: ' + backendName(st) + ' собрал sing-box без списка — перезапусти ' + backendName(st) :
-					'ещё не применён — подхватится при перезапуске ' + backendName(st)))
+					'ещё не применён — подхватится при перезапуске ' + backendName(st))),
+			cell(recheckText(st, a))
 		]);
 	}));
+}
+
+function when(ts) {
+	if (!ts)
+		return '';
+	var d = new Date(ts * 1000);
+	return ' (' + ('0' + d.getDate()).slice(-2) + '.' + ('0' + (d.getMonth() + 1)).slice(-2) + ' ' +
+		('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) + ')';
+}
+
+function recheckText(st, a) {
+	var need = (st.recheck && st.recheck.remove_after) || 3;
+	switch (a.result) {
+	case 'напрямую':
+		return E('span', { 'style': 'color:#080' }, 'открылся напрямую: ' + a.streak + ' из ' + need +
+			(st.recheck && st.recheck.auto_remove ? ' — потом уберётся' : '') + when(a.checked_at));
+	case 'заблокирован':
+		return 'напрямую не открывается' + when(a.checked_at);
+	case 'по-адресу':
+		return 'адрес в IP-списке ' + backendName(st) + ' — напрямую не проверить' + when(a.checked_at);
+	case 'нет-адреса':
+		return 'имя не резолвится' + when(a.checked_at);
+	default:
+		return 'ещё не проверялся';
+	}
+}
+
+function removedBlock(st) {
+	var removed = st.removed || [];
+	if (!removed.length)
+		return E('p', {}, 'Пока ничего не убрано.');
+	return table(['Сайт', 'Убран'], removed.map(function (r) {
+		return E('tr', { 'class': 'tr' }, [cell(r.domain), cell(r.at)]);
+	}));
+}
+
+function settingsMap() {
+	var m = new form.Map('blockwatch', 'Настройки',
+		'Меняются сразу, перезапуск не нужен: blockwatch перечитывает их на каждом заходе.');
+	var s = m.section(form.NamedSection, 'main', 'blockwatch');
+	s.addremove = false;
+	var o;
+
+	o = s.option(form.Flag, 'enabled', 'Наблюдать');
+	o.default = '1'; o.rmempty = false;
+
+	o = s.option(form.Flag, 'auto_export', 'Добавлять подтверждённые сами');
+	o.default = '1'; o.rmempty = false;
+
+	o = s.option(form.Value, 'confirm_minutes', 'Второе подтверждение через, минут',
+		'Находка добавляется после двух совпадений в разных проверках — так отсекается разовый сбой.');
+	o.datatype = 'range(2,120)'; o.placeholder = '5';
+
+	o = s.option(form.Value, 'max_per_day', 'Не больше доменов в сутки',
+		'Страховка от лавины ложных находок.');
+	o.datatype = 'range(1,200)'; o.placeholder = '30';
+
+	o = s.option(form.Value, 'max_domains', 'Предел всего списка',
+		'Дальше новые домены не добавляются, а здесь появляется предупреждение.');
+	o.datatype = 'range(10,5000)'; o.placeholder = '500';
+
+	o = s.option(form.Flag, 'auto_remove', 'Убирать то, что снова открывается напрямую');
+	o.default = '1'; o.rmempty = false;
+
+	o = s.option(form.Value, 'recheck_hours', 'Перепроверять список раз в, часов',
+		'Каждый домен открывается напрямую, мимо туннеля. После удачной проверки следующая — через сутки.');
+	o.datatype = 'range(1,720)'; o.placeholder = '72';
+
+	o = s.option(form.Value, 'remove_after', 'Убирать после удачных проверок подряд',
+		'Блокировки то включают, то снимают — одной удачи мало.');
+	o.datatype = 'range(1,10)'; o.placeholder = '3';
+
+	o = s.option(form.DynamicList, 'never_suffix', 'Не добавлять никогда',
+		'Окончания доменов. Имена своих серверов из конфига sing-box добавляются сами.');
+	o.placeholder = 'ru';
+
+	return m;
 }
 
 function foundBlock(st) {
@@ -139,6 +219,12 @@ return view.extend({
 					'добавляется в список сам.'),
 				foundBlock(s)
 			]));
+			body.appendChild(E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, 'Убрано из списка'),
+				E('p', {}, 'Домены, которые при перепроверке снова открывались напрямую. ' +
+					'Если блокировка вернётся, blockwatch найдёт их заново.'),
+				removedBlock(s)
+			]));
 		};
 
 		draw(st);
@@ -146,18 +232,17 @@ return view.extend({
 			return call(['status']).then(draw).catch(function () {});
 		}, 30);
 
-		return E('div', { 'class': 'cbi-map' }, [
-			E('h2', {}, 'Blockwatch'),
-			E('div', { 'class': 'cbi-map-descr' },
-				'Находит сайты, которые не открываются напрямую, но открываются через туннель, ' +
-				'проверяет каждый опытом и подтверждённые добавляет в список ' + backendName(st) +
-				'. Соединения при этом не рвутся. Российские домены и свои серверы не ' +
-				'добавляются никогда.'),
-			body
-		]);
-	},
-
-	handleSave: null,
-	handleSaveApply: null,
-	handleReset: null
+		return settingsMap().render().then(function (settings) {
+			return E('div', {}, [
+				E('h2', {}, 'Blockwatch'),
+				E('div', { 'class': 'cbi-map-descr' },
+					'Находит сайты, которые не открываются напрямую, но открываются через туннель, ' +
+					'проверяет каждый опытом и подтверждённые добавляет в список ' + backendName(st) +
+					'. Соединения при этом не рвутся. Российские домены и свои серверы не ' +
+					'добавляются никогда.'),
+				body,
+				settings
+			]);
+		});
+	}
 });

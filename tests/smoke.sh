@@ -110,6 +110,40 @@ T=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; now=10000; mkdir -p $DIR
     echo "9999 1 198.51.100.1 198.51.100.2 127.0.0.1:4534" > $DIR/tunnel
     tunnel_check && echo "ok $SOCKS"; rm -f $DIR/tunnel')
 check "свежий кэш туннеля: socks известен" test "$T" = "ok 127.0.0.1:4534"
+# обрыв по трём снимкам: «поток адрес наших-пакетов наших-байт байт-от-сервера»
+printf '%s\n' 'a1 138.199.15.193 20 12000 6000' 'a2 138.199.15.193 20 12000 6000' 'b 203.0.113.80 20 9000 4000' \
+    'c 203.0.113.81 50 9000 8000' 'i 213.180.204.179 40 9000 8000' 'f 198.18.0.46 20 9000 4000' > /tmp/bw-f0
+printf '%s\n' 'a1 138.199.15.193 28 16116 8345' 'a2 138.199.15.193 29 17520 9831' 'b 203.0.113.80 25 9500 6000' \
+    'c 203.0.113.81 50 9000 8000' 'i 213.180.204.179 40 9000 8000' 'f 198.18.0.46 25 9500 6000' \
+    'd 203.0.113.71 10 3000 50000' 'g 203.0.113.72 9 1200 5000' 'h 203.0.113.73 12 2545 8369' > /tmp/bw-f1
+printf '%s\n' 'a1 138.199.15.193 28 16116 8345' 'a2 138.199.15.193 29 17520 9831' 'b 203.0.113.80 25 9500 6000' \
+    'c 203.0.113.81 50 9000 8000' 'i 213.180.204.179 40 9000 8000' 'f 198.18.0.46 25 9500 6000' \
+    'd 203.0.113.71 13 3200 50000' 'g 203.0.113.72 9 1200 5400' 'h 203.0.113.73 12 2545 8369' > /tmp/bw-f2
+S=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; stalled_flows /tmp/bw-f0 /tmp/bw-f1 /tmp/bw-f2' | sort | tr '\n' ';')
+rm -f /tmp/bw-f0 /tmp/bw-f1 /tmp/bw-f2
+check "два застрявших потока к адресу — обрыв" sh -c "echo \"\$0\" | grep -q '138.199.15.193 обрыв'" "$S"
+check "один застрявший поток — замер" sh -c "echo \"\$0\" | grep -q '203.0.113.80 замер'" "$S"
+check "давно простаивает (пуш) — не замер" sh -c "! echo \"\$0\" | grep -qE '203.0.113.81|213.180.204.179'" "$S"
+check "подменный адрес — не считаем" sh -c "! echo \"\$0\" | grep -q 198.18.0.46" "$S"
+check "переспрашивают без ответа — обрыв" sh -c "echo \"\$0\" | grep -q '203.0.113.71 обрыв'" "$S"
+check "байты идут — не обрыв" sh -c "! echo \"\$0\" | grep -q 203.0.113.72" "$S"
+check "получили много больше, чем отправили, — не замер" sh -c "! echo \"\$0\" | grep -q 203.0.113.73" "$S"
+# стоп-список: кандидат с российским именем не проверяется вовсе
+: > /tmp/bw-probed
+sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; build_never; checked=0; checked_run=0; now=10000
+    probe() { echo ru >> /tmp/bw-probed; echo "200 - -"; }; domain_of() { echo push.yandex.ru; }
+    check_one 213.180.204.179 замер'
+check "стоп-список: .ru не проверяется" sh -c "! grep -qx ru /tmp/bw-probed"
+rm -f /tmp/bw-probed
+# признак «установилось и замерло» — решает адрес: сайт целиком резолвится на
+# соседний рабочий узел CDN и дал бы «живой»
+P='. /usr/bin/blockwatch >/dev/null 2>&1
+get() { case "$*" in *socks5*) echo 200 ;; *--resolve*) echo "200~" ;; *) echo 200 ;; esac; }'
+R=$(sh -c "$P; probe 138.199.46.65 cdn.example обрыв+молчит")
+check "обрыв: сайт не спасает, решает адрес" test "$R" = "- 200~ 200"
+check "обрыв: вердикт — заблокирован" test "$(V '-' '200~' 200)" = "ЗАБЛОКИРОВАН"
+R=$(sh -c "$P; probe 162.159.136.232 discord.example нет-ответа")
+check "нет ответа: соседний адрес ответил — сайт живой" test "$R" = "200 - -"
 check "in_range fakeip" sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; in_range 198.19.3.4 198.18.0.0/15'
 check "in_range чужой" sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; ! in_range 198.20.0.1 198.18.0.0/15'
 
@@ -197,14 +231,14 @@ cat > /tmp/blockwatch/verdicts <<'EOF'
 216.150.1.1|noodledude.io|лежит|0|28000|28000|нет-ответа|000~/000~/000~
 203.0.113.20|dead.example.com|лежит|0|1000|28000|нет-ответа|000~/000~/000~
 203.0.113.21|half.example.com|ЗАБЛОКИРОВАН|1|28000|28000|обрыв|200~/200~/200
-203.0.113.22|fresh.example.com|лежит|0|29500|29500|нет-ответа|000~/000~/000~
+203.0.113.22|fresh.example.com|лежит|0|29900|29900|нет-ответа|000~/000~/000~
 203.0.113.25|edge.cdn.example|лежит|0|28000|28000|обход|000~/000~/000~
 EOF
 R=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; now=30000; redo_list')
 check "«лежит» один раз — в повтор" sh -c "echo \"\$0\" | grep -qx '216.150.1.1 нет-ответа noodledude.io'" "$R"
 check "«лежит» дважды — не в повтор" sh -c "! echo \"\$0\" | grep -q dead.example.com" "$R"
 check "недоподтверждённое — в повтор" sh -c "echo \"\$0\" | grep -q half.example.com" "$R"
-check "моложе 15 минут — не в повтор" sh -c "! echo \"\$0\" | grep -q fresh.example.com" "$R"
+check "моложе 5 минут — не в повтор" sh -c "! echo \"\$0\" | grep -q fresh.example.com" "$R"
 check "«лежит» из обхода — не в повтор" sh -c "! echo \"\$0\" | grep -q edge.cdn.example" "$R"
 check "«лежит» старше RECHECK — не в повтор" sh -c "! echo \"\$0\" | grep -q ancient.example.com" "$R"
 check "свежие — первыми" test "$(echo "$R" | grep -E 'noodledude|older' | head -1 | cut -d' ' -f3)" = noodledude.io
@@ -215,16 +249,58 @@ check "после повтора first остался прежним" grep -q '^
 rm -f /tmp/blockwatch/verdicts /tmp/bw-probed
 
 echo "== после 0.1.0: её «лежит» недостоверны"
-rm -f /etc/blockwatch/verdicts.v
-printf '%s\n' '203.0.113.30|down.example.com|лежит|0|1|1|обход|000~/000~/000~' \
-    '203.0.113.31|up.example.com|живой|0|1|1|обход|200/-/-' > /tmp/blockwatch/verdicts
-sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; forget_blind_down'
-check "старое «лежит» выброшено" sh -c "! grep -q down.example.com /tmp/blockwatch/verdicts"
-check "«живой» остался" grep -q up.example.com /tmp/blockwatch/verdicts
-echo '203.0.113.32|new.example.com|лежит|0|2|2|сброс|000~/000~/000~' >> /tmp/blockwatch/verdicts
-sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; forget_blind_down'
-check "чистка только один раз" grep -q new.example.com /tmp/blockwatch/verdicts
-rm -f /tmp/blockwatch/verdicts /etc/blockwatch/verdicts.v
+V3='203.0.113.30|down.example.com|лежит|0|1|1|обход|000~/000~/000~
+203.0.113.31|up.example.com|живой|0|1|1|обход|200/-/-
+203.0.113.33|hit.example.com|ЗАБЛОКИРОВАН|2|1|1|обрыв|200~/200~/200'
+rm -f /etc/blockwatch/verdicts.v; echo "$V3" > /tmp/blockwatch/verdicts
+sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; forget_stale_verdicts'
+check "с 0.1.0: «лежит» выброшено" sh -c "! grep -q down.example.com /tmp/blockwatch/verdicts"
+check "с 0.1.0: «живой» выброшен" sh -c "! grep -q up.example.com /tmp/blockwatch/verdicts"
+check "с 0.1.0: находка осталась" grep -q hit.example.com /tmp/blockwatch/verdicts
+echo 2 > /etc/blockwatch/verdicts.v; echo "$V3" > /tmp/blockwatch/verdicts
+sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; forget_stale_verdicts'
+check "с версии 2: «лежит» остался" grep -q down.example.com /tmp/blockwatch/verdicts
+check "с версии 2: «живой» выброшен" sh -c "! grep -q up.example.com /tmp/blockwatch/verdicts"
+echo "$V3" > /tmp/blockwatch/verdicts
+sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; forget_stale_verdicts'
+check "чистка только один раз" grep -q up.example.com /tmp/blockwatch/verdicts
+# «живой», по которому снова есть признак в трафике, — через час, а не через 6 часов
+echo "203.0.113.40|cdn.example|живой|0|1000|1000|обход|200/-/-" > /tmp/blockwatch/verdicts
+: > /tmp/bw-probed
+sh -c "$CK; now=5000; PROBE=sym; check_one 203.0.113.40 обрыв cdn.example"
+check "«живой» + обрыв через час — проверяется" grep -qx sym /tmp/bw-probed
+echo "203.0.113.40|cdn.example|живой|0|1000|1000|обход|200/-/-" > /tmp/blockwatch/verdicts
+: > /tmp/bw-probed
+sh -c "$CK; now=5000; PROBE=sweep; check_one 203.0.113.40 обход cdn.example"
+check "«живой» + обход — ждёт 6 часов" sh -c "! grep -qx sweep /tmp/bw-probed"
+# порядок кандидатов: «1 из 2» — первыми, потом без вердикта, потом прочие
+printf '%s\n' '203.0.113.60|old.example|живой|0|1|1|обход|200/-/-' \
+    '203.0.113.61|pend.example|ЗАБЛОКИРОВАН|1|1|1|обрыв|200~/200~/200' > /tmp/blockwatch/verdicts
+cp /tmp/blockwatch/ipmap /tmp/bw-ipmap.save 2>/dev/null; echo "203.0.113.63 named.example" > /tmp/blockwatch/ipmap
+O=$(printf '203.0.113.60 сброс\n203.0.113.62 молчит\n203.0.113.64 молчит+обрыв\n203.0.113.63 сброс\n203.0.113.61 молчит\n' |
+    sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; cand_order' | awk '{print $1}' | tr '\n' ' ')
+mv /tmp/bw-ipmap.save /tmp/blockwatch/ipmap 2>/dev/null || rm -f /tmp/blockwatch/ipmap
+check "порядок: 1 из 2, обрыв, с именем, без имени, прочие" test "$O" = "203.0.113.61 203.0.113.64 203.0.113.63 203.0.113.62 203.0.113.60 "
+# человек снова открыл сайт — второе подтверждение через минуту, а не через 5
+echo "203.0.113.61|pend.example|ЗАБЛОКИРОВАН|1|1000|1000|обрыв|200~/200~/200" > /tmp/blockwatch/verdicts
+: > /tmp/bw-probed
+sh -c "$CK; now=1070; PROBE=f5; check_one 203.0.113.61 обрыв pend.example"
+check "повторный заход через минуту — подтверждение" grep -qx f5 /tmp/bw-probed
+echo "203.0.113.61|pend.example|ЗАБЛОКИРОВАН|1|1000|1000|обрыв|200~/200~/200" > /tmp/blockwatch/verdicts
+: > /tmp/bw-probed
+sh -c "$CK; now=1070; PROBE=sw; check_one 203.0.113.61 обход pend.example"
+check "обход — ждёт confirm_minutes" sh -c "! grep -qx sw /tmp/bw-probed"
+# туннель не ответил на подтверждении — находка не теряется, но только один раз
+echo "203.0.113.50|flaky.example|ЗАБЛОКИРОВАН|1|1000|1000|обрыв|200~/200~/200" > /tmp/blockwatch/verdicts
+IN='. /usr/bin/blockwatch >/dev/null 2>&1; probe() { echo "200~ 200~ 000~"; }; checked=0; checked_run=0'
+sh -c "$IN; now=2000; check_one 203.0.113.50 обрыв flaky.example"
+check "туннель не ответил — «1 из 2» держится" grep -q '^203.0.113.50|flaky.example|ЗАБЛОКИРОВАН|1|1000|2000|обрыв|200~/200~/000~$' /tmp/blockwatch/verdicts
+sh -c "$IN; now=3000; check_one 203.0.113.50 обрыв flaky.example"
+check "и второй раз подряд — сдаётся" grep -q '^203.0.113.50|flaky.example|лежит|0|' /tmp/blockwatch/verdicts
+echo "203.0.113.50|flaky.example|ЗАБЛОКИРОВАН|1|1000|1000|обрыв|200~/200~/200" > /tmp/blockwatch/verdicts
+sh -c ". /usr/bin/blockwatch >/dev/null 2>&1; probe() { echo '200 - -'; }; checked=0; checked_run=0; now=2000; check_one 203.0.113.50 обрыв flaky.example"
+check "ответ напрямую — сбрасывает" grep -q '^203.0.113.50|flaky.example|живой|0|' /tmp/blockwatch/verdicts
+rm -f /tmp/blockwatch/verdicts /etc/blockwatch/verdicts.v /tmp/bw-probed /tmp/blockwatch/state.dirty
 
 echo "== пределы: список, журнал, запись на флеш"
 printf '# шапка\na.example\nb.example\nc.example\n' > /tmp/bw-dom.txt
@@ -256,6 +332,68 @@ echo "1.2.3.4|newer.example|живой|0|3|3|обход|200/-/-" > /tmp/blockwat
 sh -c "$S; STATE_EVERY=0; save_state"
 check "прошёл час: пишем" grep -q newer.example /tmp/bw-st/verdicts
 rm -rf /tmp/bw-st /tmp/blockwatch/verdicts
+
+echo "== обрыв на маленьком ответе: повтор в одном соединении"
+# curl подменён: одиночный запрос отдаёт 505 байт; повтор (много URL сразу)
+# либо висит — как оборванное соединение, — либо проходит
+G='. /usr/bin/blockwatch >/dev/null 2>&1; BULK_TIME=2
+curl() { case "$*" in *"%{http_code}"*) printf "200 505"; return 0 ;; esac
+         [ "$MODE" = cut ] && { sleep 30; return 0; }; return 0; }'
+S=$(date +%s)
+R=$(sh -c "$G; MODE=cut; get 9 https://cdn.example/")
+check "маленький ответ + оборванный повтор — 200~" test "$R" = "200~"
+check "повтор ограничен по времени" test $(( $(date +%s) - S )) -le 6
+R=$(sh -c "$G; MODE=ok; get 9 https://cdn.example/")
+check "маленький ответ + целый повтор — 200" test "$R" = "200"
+R=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; curl() { printf "200 50000"; }; bulk() { echo called >> /tmp/bw-bulk; return 1; }; get 9 https://big.example/')
+check "большой ответ — без повтора" sh -c "test '$R' = 200 && test ! -f /tmp/bw-bulk"
+rm -f /tmp/bw-bulk
+R=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; curl() { printf "200 548255"; return 28; }; get 9 https://slow.example/')
+check "таймаут на большой странице — не обрыв" test "$R" = 200
+R=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; curl() { printf "200 13037"; return 28; }; get 9 https://cut.example/')
+check "замерло на 13 КБ — обрыв" test "$R" = "200~"
+
+echo "== перепроверка списка"
+mkdir -p /tmp/blockwatch /tmp/bw-rs
+printf '# 2026-09-29 10:00\nopen.example\nshut.example\nbyip.example\n' > /tmp/bw-rd.txt
+echo '{"version":3,"rules":[{"domain_suffix":["byip.example","open.example","shut.example"]}]}' > /tmp/bw-rs/rs.json
+echo "1.1.1.1|open.example|ЗАБЛОКИРОВАН|2|1|1|обрыв|200~/200~/200" > /tmp/blockwatch/verdicts
+RC='. /usr/bin/blockwatch >/dev/null 2>&1
+DOMAINS_FILE=/tmp/bw-rd.txt; LISTED=/tmp/bw-listed; LOG=/tmp/bw-rlog; REMOVE_AFTER=2
+checked=0; checked_run=0
+dns_a() { case "$1" in byip.*) echo 104.16.0.1 ;; *) echo 203.0.113.50 ;; esac; }
+in_backend_set() { [ "$1" = 104.16.0.1 ]; }
+get() { case "$*" in *open.example*) echo 200 ;; *) echo "200~" ;; esac; }
+live_ruleset() { echo /tmp/bw-rs/rs.json; }'
+rm -f /tmp/bw-listed /tmp/bw-rlog
+check "все три — на перепроверку" test "$(sh -c "$RC; now=1000; RECHECK_LISTED=259200; listed_due" | wc -l)" = 3
+for t in 1000 2000; do sh -c "$RC; now=$t; RECHECK_LISTED=0; for d in open.example shut.example byip.example; do recheck_one \$d; done"; done
+check "открывшийся напрямую убран из файла" sh -c "! grep -qx open.example /tmp/bw-rd.txt"
+check "…и из живого набора" sh -c "! jq -r '.rules[0].domain_suffix[]' /tmp/bw-rs/rs.json | grep -qx open.example"
+check "…и из вердиктов" sh -c "! grep -q open.example /tmp/blockwatch/verdicts"
+check "…и записан в журнал" grep -q 'УБРАН open.example' /tmp/bw-rlog
+check "заблокированный остался" grep -qx shut.example /tmp/bw-rd.txt
+check "заблокированный: серия удач 0" grep -q '^shut.example|2000|0|200~|заблокирован$' /tmp/bw-listed
+check "адрес в IP-списке — не проверяется и остаётся" sh -c "grep -qx byip.example /tmp/bw-rd.txt && grep -q '^byip.example|2000|0|-|по-адресу$' /tmp/bw-listed"
+printf 'keep.example\n' >> /tmp/bw-rd.txt
+sh -c "$RC; now=3000; RECHECK_LISTED=0; get() { echo 200; }; recheck_one keep.example"
+sh -c "$RC; now=4000; RECHECK_LISTED=0; get() { echo '200~'; }; recheck_one keep.example"
+check "неудача обнуляет серию" grep -q '^keep.example|4000|0|' /tmp/bw-listed
+D=$(sh -c "$RC; now=100000; RECHECK_LISTED=259200; listed_due")
+check "после неудачи — ждёт полный интервал" sh -c "! echo \"\$0\" | grep -qx keep.example" "$D"
+sh -c "$RC; now=5000; RECHECK_LISTED=259200; get() { echo 200; }; recheck_one keep.example"
+D=$(sh -c "$RC; now=95000; RECHECK_LISTED=259200; listed_due")
+check "после удачи — через сутки" sh -c "echo \"\$0\" | grep -qx keep.example" "$D"
+sh -c "$RC; now=6000; RECHECK_LISTED=0; AUTO_REMOVE=0; get() { echo 200; }; recheck_one keep.example"
+check "auto_remove=0 — не убирает" grep -qx keep.example /tmp/bw-rd.txt
+rm -rf /tmp/bw-rd.txt /tmp/bw-rs /tmp/bw-listed /tmp/bw-rlog /tmp/blockwatch/verdicts
+N=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; checked=0; checked_run=0; MAX_TICK=2
+    sweep_filter() { printf "203.0.113.1 a.example\n203.0.113.2 b.example\n203.0.113.3 c.example\n"; }
+    check_one() { checked=$((checked + 1)); }
+    sweep 1; echo $checked')
+check "обход с пределом 1 — одна проверка" test "$N" = 1
+blockwatch status > /tmp/s.json 2>/dev/null
+check "status: настройки перепроверки" jq -e '.recheck.hours == 72 and .recheck.remove_after == 3 and .recheck.auto_remove == true and (.removed | type == "array")' /tmp/s.json
 
 echo "== hook / unhook"
 blockwatch hook main >/dev/null 2>&1

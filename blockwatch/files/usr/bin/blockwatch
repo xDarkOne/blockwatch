@@ -42,6 +42,8 @@ WINDOW=100         # длительность захода: cron запуска�
 MAX_TICK=2         # проверок за шаг
 MAX_RUN=10         # проверок за заход
 RECHECK=21600      # как часто перепроверять уже решённое, секунд
+ALIVE_RECHECK=3600 # «живой», по которому снова есть признак в трафике
+CONFIRM_SYMPTOM=60 # второе подтверждение, если сайт снова открывали
 MIN_RST=3          # сбросов до кандидата
 MIN_SYN=4          # неотвеченных SYN до кандидата
 MIN_DATA=2         # пакетов с данными без ответа до кандидата
@@ -58,9 +60,19 @@ AUTO_EXPORT=$(cfg auto_export 1)
 MAX_DAY=$(cfg max_per_day 30)
 # Предел списка: на тесных роутерах свободно ~1,5 МБ флеша, а список и
 # журнал иначе росли бы без конца. По достижении новые домены не добавляются
-# (с предупреждением), старые сами не удаляются — иначе заблокированный сайт
-# мог бы молча перестать открываться.
+# (с предупреждением). Место освобождает только перепроверка: из списка
+# уходит то, что снова открывается напрямую. Выкидывать старое по возрасту
+# нельзя — заблокированный сайт молча перестал бы открываться.
 MAX_TOTAL=$(cfg max_domains 500)
+# Перепроверка списка: раз в RECHECK_LISTED домен открывают напрямую; после
+# удачи следующая — через сутки. Убирается после REMOVE_AFTER удач подряд:
+# блокировки то включают, то снимают, одной удачи мало.
+AUTO_REMOVE=$(cfg auto_remove 1)
+# Второе подтверждение находки — не раньше чем через столько: два совпадения в
+# разных заходах отсекают разовый сбой, а ждать дольше незачем. Было 15 минут.
+CONFIRM_AFTER=$(($(cfg confirm_minutes 5) * 60))
+RECHECK_LISTED=$(($(cfg recheck_hours 72) * 3600))
+REMOVE_AFTER=$(cfg remove_after 3)
 LOG_KEEP=500       # строк журнала находок
 STATE_EVERY=3600   # как часто сохранять вердикты на флеш, секунд
 
@@ -92,6 +104,12 @@ detect_backend() {
     SB_CONFIG=""
     [ -n "$BACKEND" ] && SB_CONFIG=$(uci -q get "$BACKEND.settings.config_path")
     SB_CONFIG=${SB_CONFIG:-/etc/sing-box/config.json}
+    # Настоящий адрес для перепроверки списка — мимо sing-box: его DNS для
+    # домена из списка отдаёт подменный, и проверка ушла бы в туннель.
+    DIRECT_DNS=$(cfg direct_dns "")
+    [ -n "$DIRECT_DNS" ] || [ -z "$BACKEND" ] ||
+        DIRECT_DNS=$(uci -q get "$BACKEND.settings.bootstrap_dns_server" | sed 's/[#:].*//')
+    DIRECT_DNS=${DIRECT_DNS:-77.88.8.8}
 }
 
 const() {   # имя, значение по умолчанию
@@ -395,19 +413,67 @@ flows_now() {
 }
 
 # --- проверка опытом ----------------------------------------------------------
-get() {   # таймаут, url, [аргументы curl] -> код, «~» если передача оборвалась
-    _to=$1; _url=$2; shift 2
-    _c=$(curl -4 -s -o /dev/null -m "$_to" "$@" -w '%{http_code}' "$_url" 2>/dev/null)
-    if [ $? -ne 0 ]; then echo "${_c:-000}~"; else echo "${_c:-000}"; fi
+BULK_MIN=20000     # ответ меньше — обрыв на ~16 КБ им не проверить
+BULK_NEED=24000    # столько байт добираем повторами в одном соединении
+BULK_TIME=15       # и не дольше, секунд
+
+lim() {   # секунд команда... — ограничение времени без timeout (его нет в busybox)
+    _lt=$1; shift
+    "$@" & _lp=$!
+    ( sleep "$_lt"; kill "$_lp" 2>/dev/null ) & _lk=$!
+    wait "$_lp"; _lr=$?
+    kill "$_lk" 2>/dev/null
+    return $_lr
 }
 
-ok() { case "$1" in 000|*~) return 1 ;; *) return 0 ;; esac; }
+get() {   # таймаут, url, [аргументы curl] -> код, «~» если передача оборвалась
+    _to=$1; _url=$2; shift 2
+    _o=$(curl -4 -s -o /dev/null -m "$_to" "$@" -w '%{http_code} %{size_download}' "$_url" 2>/dev/null)
+    _r=$?; _c=${_o%% *}; _s=${_o##* }
+    if [ "$_r" -ne 0 ]; then
+        # Большая страница может не успеть за таймаут — это медленный сайт, а
+        # не блокировка: обрыв режет на 11–16 КБ (sameerasw.com, noodledude.io,
+        # cdn77). rawg.io (548 КБ) иначе выходил «заблокированным».
+        if [ "${_s:-0}" -ge "$BULK_NEED" ] 2>/dev/null; then echo "$_c"; else echo "${_c:-000}~"; fi
+        return
+    fi
+    case "$_c" in ""|000) echo 000; return ;; esac
+    # Обрыв режет соединение после ~16 КБ от сервера. Маленький ответ (корень
+    # CDN, редирект) под порог пролезает, и заблокированный хост выглядит
+    # живым — так на grisha пропустили cdn.db.io: корень 505 байт, а стили и
+    # картинки dbrand.com с него не грузились. Поэтому маленький ответ
+    # запрашиваем ещё раз подряд в том же соединении, пока не наберётся больше
+    # порога: оборванное соединение замрёт, живое отдаст всё.
+    [ "${_s:-0}" -ge "$BULK_MIN" ] 2>/dev/null && { echo "$_c"; return; }
+    if bulk "$_url" "${_s:-0}" "$@"; then echo "$_c"; else echo "$_c~"; fi
+}
 
-probe() {   # адрес, [имя] -> «сайт адрес туннель»
-    _ip=$1; _dom=$2
+bulk() {   # url размер_ответа [аргументы curl] -> 0, если всё пришло в срок
+    _u=$1; _one=$2; shift 2
+    _n=$((BULK_NEED / (_one + 300) + 1)); [ "$_n" -gt 80 ] && _n=80
+    _i=0
+    while [ "$_i" -lt "$_n" ]; do set -- "$@" "$_u"; _i=$((_i + 1)); done
+    lim "$BULK_TIME" curl -4 -s -o /dev/null -m "$BULK_TIME" "$@" >/dev/null 2>&1
+}
+
+ok() { case "$1" in 000|*~|-|"") return 1 ;; *) return 0 ;; esac; }
+
+# Судьбу обычно решает сайт целиком, а не адрес: у discord.com из пяти адресов
+# не отвечал один, и браузер просто брал соседний. Но так только когда
+# соединение не устанавливается (нет ответа, сброс). Если оно установилось и
+# замерло (обрыв, молчит), браузер на другой адрес не переходит и висит — а
+# проверка «сайта целиком» заново резолвит имя, попадает на рабочий узел CDN и
+# выносит «живой». Так дома пропускали cdn.db.io: браузер упирался в
+# 138.199.46.65, а проверка ходила на соседний узел. Для этих признаков
+# решает адрес, в который упирается браузер.
+probe() {   # адрес, [имя], [признак] -> «сайт адрес туннель»
+    _ip=$1; _dom=$2; _why=$3
     if [ -n "$_dom" ]; then
-        _w=$(get 9 "https://$_dom/")
-        ok "$_w" && { echo "$_w - -"; return; }
+        case "$_why" in
+            *обрыв*|*молчит*|*замер*) _w="-" ;;
+            *)  _w=$(get 9 "https://$_dom/")
+                ok "$_w" && { echo "$_w - -"; return; } ;;
+        esac
         _d=$(get 7 "https://$_dom/" --resolve "$_dom:443:$_ip")
         _v=$(get 10 "https://$_dom/" --resolve "$_dom:443:$_ip" -x "socks5://$SOCKS")
     else
@@ -443,7 +509,7 @@ scan() {
     trap 'rm -f "$DIR/lock"' EXIT INT TERM
     touch "$DIR/ipmap" "$DIR/silent" "$DIR/verdicts" "$DIR/flows"
     [ -s "$DIR/verdicts" ] || { [ -s "$STATE" ] && cp -f "$STATE" "$DIR/verdicts"; }
-    forget_blind_down
+    forget_stale_verdicts
 
     if [ -z "$BACKEND" ]; then
         logger -t blockwatch "не найден netshift/podkop — заход пропущен"
@@ -455,10 +521,11 @@ scan() {
 
     checked_run=0
     deadline=$((now + WINDOW))
+    tick=0
 
   while :; do
     now=$(date +%s)
-    checked=0
+    checked=0; tick=$((tick + 1))
     update_ipmap
 
     set_counts syn_out  > "$DIR/syn"
@@ -475,17 +542,13 @@ scan() {
         "$DIR/silent" "$DIR/silent.now" > "$DIR/silent.tmp" 2>/dev/null
     mv "$DIR/silent.tmp" "$DIR/silent"
 
-    # обрыв: поток жив, байты от сервера не изменились, а наших пакетов стало
-    # больше на два и более — ждём и переспрашиваем. Бездействующее соединение
-    # так не выглядит: там молчат обе стороны.
     flows_now > "$DIR/flows.now"
-    awk 'NR == FNR { p[$1] = $3; b[$1] = $5; next }
-         ($1 in b) && $5 == b[$1] && $5 > 0 && $4 > 200 && $3 >= p[$1] + 2 { print $2 }' \
-        "$DIR/flows" "$DIR/flows.now" 2>/dev/null | sort -u > "$DIR/stalled"
-    mv "$DIR/flows.now" "$DIR/flows"
+    touch "$DIR/flows.old"
+    stalled_flows "$DIR/flows.old" "$DIR/flows" "$DIR/flows.now" > "$DIR/stalled"
+    mv "$DIR/flows" "$DIR/flows.old"; mv "$DIR/flows.now" "$DIR/flows"
 
     {
-        awk '{ print $1, "обрыв" }' "$DIR/stalled"
+        cat "$DIR/stalled"
         awk -v m="$MIN_RST" '$2 + 0 >= m { print $1, "сброс" }' "$DIR/rst"
         awk -v m="$MIN_SYN" 'NR == FNR { a[$1] = 1; next }
              $2 + 0 >= m && !($1 in a) { print $1, "нет-ответа" }' "$DIR/ack" "$DIR/syn"
@@ -494,20 +557,34 @@ scan() {
         awk -v m="$MIN_SILENT" 'NR == FNR { s[$1] = 1; next }
              ($1 in s) && $2 + 0 >= m { print $1, "тишина" }' "$DIR/syn" "$DIR/silent"
     } 2>/dev/null | awk '{ r[$1] = (r[$1] == "" ? $2 : r[$1] "+" $2) }
-                         END { for (k in r) print k, r[k] }' > "$DIR/cand"
+                         END { for (k in r) print k, r[k] }' > "$DIR/cand.raw"
+    cand_order < "$DIR/cand.raw" > "$DIR/cand"
 
     # без настоящего туннеля проверять нечем: только копим признаки
     if [ "$TUNNEL" = 1 ]; then
-        while read -r ip why; do check_one "$ip" "$why" || break; done < "$DIR/cand"
+        # Гарантированное место: на загруженной сети кандидатов из счётчиков
+        # сотня, и «свободного» шага для перепроверки и обхода не бывает
+        # никогда — на домашнем роутере перепроверка так и не запустилась.
+        # Поэтому первый шаг захода отдаём перепроверке списка, второй — одному
+        # имени обхода, а кандидаты берут то, что осталось.
+        [ "$tick" = 1 ] && recheck_listed
+        [ "$tick" = 2 ] && sweep 1
 
-        # недоподтверждённое доводим до конца: к именам с вердиктом обход не
-        # возвращается, и второй проверки иначе не было бы никогда
+        # Недоподтверждённое доводим до конца — раньше новых кандидатов: это
+        # уже найденные блокировки, им не хватает одной проверки. Когда повтор
+        # шёл после кандидатов, их полсотни съедали весь шаг, и cdn.db.io на
+        # grisha полчаса висел на «1 из 2». К именам с вердиктом обход не
+        # возвращается, так что второй проверки иначе не было бы вовсе.
         redo_list > "$DIR/redo" 2>/dev/null
         while read -r rip rwhy rdom; do
             [ "$rdom" = "-" ] && rdom=""
             check_one "$rip" "$rwhy" "$rdom" || break
         done < "$DIR/redo"
 
+        while read -r ip why; do check_one "$ip" "$why" || break; done < "$DIR/cand"
+
+        # свободный шаг: сначала перепроверка списка, потом обход новых имён
+        [ "$checked" -eq 0 ] && recheck_listed
         [ "$checked" -eq 0 ] && sweep
 
         [ "$AUTO_EXPORT" = 1 ] && export_domains auto >/dev/null 2>&1
@@ -544,7 +621,56 @@ log_find() {   # строка в журнал находок; журнал не 
 
 domains_count() { grep -cvE '^[[:space:]]*(#|$)' "$DOMAINS_FILE" 2>/dev/null || true; }
 
-# Что перепроверить через 15 минут, не дожидаясь RECHECK: недоподтверждённые
+# Обрыв по двум снимкам таблицы соединений (строки flows_now: поток, адрес,
+# наших пакетов, наших байт, байт от сервера). Два вида:
+#   переспрашивают — от сервера не прибавилось ни байта, а наших пакетов стало
+#     больше на два и более; бездействующее соединение так не выглядит, там
+#     молчат обе стороны;
+#   замер — клиент молча ждёт: от сервера пришло 2–24 КБ (обрыв режет на
+#     11–16 КБ), на прошлом шаге ещё прибавлялось, а на этом встало, и
+#     отправили мы хотя бы половину полученного. Обычная загрузка получает
+#     много больше, чем отправляет, а простаивающие пуш- и websocket-соединения
+#     стоят давно — «только что качал» отсекает их (дома 25 ложных адресов за
+#     шаг → 5). Так телефон на grisha висел на cdn.db.io с 4,7–9,8 КБ на
+#     соединение, и blockwatch этого не видел.
+# Замер сразу в двух потоках к адресу — это обрыв: браузер переподключается.
+# Одиночный остаётся «замером» и идёт в очередь последним. Подменные адреса
+# бэкенда (трафик уже в туннеле) не считаем.
+stalled_flows() {   # позапрошлый снимок, прошлый, текущий -> «адрес признак»
+    awk -v net="$FAKEIP_RANGE" '
+        function num(a,  q) { split(a, q, "."); return ((q[1] * 256 + q[2]) * 256 + q[3]) * 256 + q[4] }
+        BEGIN { split(net, x, "/"); size = 2 ^ (32 - (x[2] == "" ? 32 : x[2])); base = int(num(x[1]) / size) }
+        FILENAME == ARGV[1] { b0[$1] = $5; next }
+        FILENAME == ARGV[2] { p[$1] = $3; b[$1] = $5; next }
+        !($1 in b) || $5 != b[$1] || int(num($2) / size) == base { next }
+        $5 > 0 && $4 > 200 && $3 >= p[$1] + 2 { ask[$2] = 1; next }
+        $5 >= 2000 && $5 < 24000 && $4 * 2 >= $5 && !(($1 in b0) && b0[$1] == b[$1]) { z[$2]++ }
+        END { for (k in ask) print k, "обрыв"
+              for (k in z) if (!(k in ask)) print k, (z[k] >= 2 ? "обрыв" : "замер") }' \
+        "$1" "$2" "$3" 2>/dev/null
+}
+
+# Порядок кандидатов. Их на загруженной сети сотня, а мёртвый адрес
+# проверяется до ~40 с, так что за заход успевают немногие — важно, кто
+# первый. Дома cdn.db.io, куда упирался браузер, стоял в очереди среди сотни
+# безымянных адресов Google. Порядок:
+#   0 — находки «1 из 2»: человек снова открыл сайт, это второе подтверждение;
+#   1 — свежий обрыв: соединение замерло на этом шаге, в него упираются сейчас;
+#   2 — без вердикта, имя известно;  3 — без вердикта и без имени;  4 — прочие.
+cand_order() {   # «адрес признак» на входе
+    awk -v vf="$DIR/verdicts" -v mf="$DIR/ipmap" '
+        BEGIN { while ((getline l < vf) > 0) { split(l, a, "|")
+                    if (a[3] == "ЗАБЛОКИРОВАН" && a[4] + 0 < 2) pend[a[1]] = 1; seen[a[1]] = 1 }
+                while ((getline l < mf) > 0) { split(l, a, " "); named[a[1]] = 1 } }
+        { if ($1 in pend) p = 0
+          else if ($2 ~ /обрыв/) p = 1
+          else if (!($1 in seen)) p = ($1 in named) ? 2 : 3
+          else p = 4
+          print p, $0 }' |
+        sort -s -n -k1,1 | cut -d' ' -f2-
+}
+
+# Что перепроверить через CONFIRM_AFTER, не дожидаясь RECHECK: недоподтверждённые
 # блокировки и «лежит», проверенное лишь раз по признаку в трафике. Во втором
 # случае мог на миг не ответить сам туннель — так noodledude.io лёг на 6 часов
 # с кодами 000~/000~/000~, хотя через туннель открывался. «Лежит» из обхода не
@@ -553,8 +679,8 @@ domains_count() { grep -cvE '^[[:space:]]*(#|$)' "$DOMAINS_FILE" 2>/dev/null || 
 redo_list() {
     # время — в начало строки: `sort -t'|' -k6,6nr` в разных sort ведёт себя по-разному
     awk -F'|' '{ print $6 " " $0 }' "$DIR/verdicts" | sort -rn | cut -d' ' -f2- |
-    awk -F'|' -v now="$now" -v rc="$RECHECK" '
-        now - $6 >= 900 && (($3 == "ЗАБЛОКИРОВАН" && $4 + 0 < 2) ||
+    awk -F'|' -v now="$now" -v rc="$RECHECK" -v ca="$CONFIRM_AFTER" '
+        now - $6 >= ca && (($3 == "ЗАБЛОКИРОВАН" && $4 + 0 < 2) ||
                             ($3 == "лежит" && $5 == $6 && $7 != "обход" && now - $6 < rc)) {
             print $1, $7, $2 }'
 }
@@ -566,14 +692,90 @@ verdict_line() {   # адрес имя
     awk -F'|' -v ip="$1" -v d="$2" '$1 == ip && $2 == d' "$DIR/verdicts" 2>/dev/null | tail -1
 }
 
-# Один раз после обновления с 0.1.0: её «лежит» почти все получены без
-# туннеля (см. tunnel_check) и ничего не значат. Выбрасываем — обход проверит
-# эти имена заново. «Живой» и «ЗАБЛОКИРОВАН» от той ошибки не зависели.
-forget_blind_down() {
-    [ "$(cat "$STATE_DIR/verdicts.v" 2>/dev/null)" = 2 ] && return 0
-    awk -F'|' '$3 != "лежит"' "$DIR/verdicts" > "$DIR/v.tmp" 2>/dev/null &&
-        mv "$DIR/v.tmp" "$DIR/verdicts"
-    mkdir -p "$STATE_DIR"; echo 2 > "$STATE_DIR/verdicts.v"
+# Один раз после обновления выбрасываем вердикты, полученные проверкой, которой
+# больше нет; обход и признаки проверят эти имена заново. Версия в verdicts.v:
+#   2 — «лежит» из 0.1.0: почти все получены без туннеля (см. tunnel_check);
+#   3 — «живой» до повтора в одном соединении (см. get): маленький ответ CDN
+#       пролезал под обрыв, так дома «живым» числился cdn.db.io.
+VERDICTS_V=3
+forget_stale_verdicts() {
+    _vv=$(cat "$STATE_DIR/verdicts.v" 2>/dev/null); _vv=${_vv:-1}
+    [ "$_vv" -ge "$VERDICTS_V" ] 2>/dev/null && return 0
+    awk -F'|' -v v="$_vv" '!(v < 2 && $3 == "лежит") && !(v < 3 && $3 == "живой")' \
+        "$DIR/verdicts" > "$DIR/v.tmp" 2>/dev/null && mv "$DIR/v.tmp" "$DIR/verdicts"
+    mkdir -p "$STATE_DIR"; echo "$VERDICTS_V" > "$STATE_DIR/verdicts.v"
+}
+
+# --- перепроверка списка -------------------------------------------------------
+# $LISTED: «домен|последняя проверка|удач подряд|коды|итог». Итог: напрямую,
+# заблокирован, по-адресу (адрес в IP-списке бэкенда — трафик к нему уходит в
+# туннель и с роутера, проверить напрямую нельзя), нет-адреса.
+LISTED=$STATE_DIR/listed
+
+listed_due() {   # домены из списка, которым пора на перепроверку, давние первыми
+    touch "$LISTED" "$DOMAINS_FILE" 2>/dev/null
+    awk -F'|' -v now="$now" -v rc="$RECHECK_LISTED" -v lf="$LISTED" '
+        FILENAME == lf { last[$1] = $2; st[$1] = $3; next }
+        /^[[:space:]]*(#|$)/ { next }
+        { d = $1; iv = (st[d] > 0 && rc > 86400) ? 86400 : rc
+          if (!(d in last) || now - last[d] >= iv) print ((d in last) ? last[d] : 0), d }' \
+        "$LISTED" "$DOMAINS_FILE" | sort -n | cut -d' ' -f2
+}
+
+in_backend_set() {   # адрес — есть в IP-списке бэкенда (nft сам ищет в диапазонах)
+    [ -n "$NFT_TABLE" ] && [ -n "$NFT_SET" ] &&
+        nft get element inet "$NFT_TABLE" "$NFT_SET" "{ $1 }" >/dev/null 2>&1
+}
+
+recheck_listed() {   # одна сетевая проверка за шаг
+    listed_due > "$DIR/due" 2>/dev/null
+    _n=0
+    while read -r _ld; do
+        _n=$((_n + 1)); [ "$_n" -gt 10 ] && break
+        recheck_one "$_ld"
+        [ "$checked" -gt 0 ] && break
+    done < "$DIR/due"
+}
+
+recheck_one() {   # домен
+    _d=$1
+    _prev=$(awk -F'|' -v d="$_d" '$1 == d' "$LISTED" 2>/dev/null | tail -1)
+    _st=$(echo "$_prev" | cut -d'|' -f3); _st=${_st:-0}
+    _ip=$(dns_a "$_d" "$DIRECT_DNS")
+    if [ -z "$_ip" ]; then _res="нет-адреса"; _codes="-"
+    elif in_backend_set "$_ip"; then _res="по-адресу"; _codes="-"
+    else
+        _codes=$(get 9 "https://$_d/" --resolve "$_d:443:$_ip")
+        checked=$((checked + 1)); checked_run=$((checked_run + 1))
+        if ok "$_codes"; then _st=$((_st + 1)); _res="напрямую"; else _st=0; _res="заблокирован"; fi
+    fi
+    awk -F'|' -v d="$_d" '$1 != d' "$LISTED" > "$LISTED.tmp" 2>/dev/null
+    echo "$_d|$now|$_st|$_codes|$_res" >> "$LISTED.tmp"
+    mv "$LISTED.tmp" "$LISTED"
+    if [ "$_res" = напрямую ] && [ "$_st" -ge "$REMOVE_AFTER" ] && [ "$AUTO_REMOVE" = 1 ]; then
+        remove_domain "$_d" "$_codes"
+    fi
+    return 0
+}
+
+remove_domain() {   # домен коды — убрать из файла, из живого набора и из памяти
+    _d=$1
+    grep -vxF "$_d" "$DOMAINS_FILE" > "$DOMAINS_FILE.tmp" && mv "$DOMAINS_FILE.tmp" "$DOMAINS_FILE"
+    if _f=$(live_ruleset); then
+        if jq --arg d "$_d" '.rules |= map(if .domain_suffix then .domain_suffix -= [$d] else . end)' \
+               "$_f" > "$_f.bw-new" 2>/dev/null && jq -e . "$_f.bw-new" >/dev/null 2>&1; then
+            mv "$_f.bw-new" "$_f"
+        else
+            rm -f "$_f.bw-new"
+        fi
+    fi
+    # вердикты тоже: иначе перенос вернул бы домен как подтверждённый, а обход
+    # не вернулся бы к нему никогда — вернётся блокировка, найдём заново
+    awk -F'|' -v d="$_d" '$2 != d' "$DIR/verdicts" > "$DIR/v.tmp" 2>/dev/null && mv "$DIR/v.tmp" "$DIR/verdicts"
+    awk -F'|' -v d="$_d" '$1 != d' "$LISTED" > "$LISTED.tmp" 2>/dev/null && mv "$LISTED.tmp" "$LISTED"
+    log_find "УБРАН $_d открывается напрямую $REMOVE_AFTER раза подряд, коды=$2"
+    logger -t blockwatch "убран из списка: $_d — снова открывается напрямую"
+    touch "$DIR/state.dirty"
 }
 
 check_one() {   # адрес, признак, [имя]
@@ -583,26 +785,45 @@ check_one() {   # адрес, признак, [имя]
     [ "$checked_run" -ge "$MAX_RUN" ] && return 1
 
     [ -n "$dom" ] || dom=$(domain_of "$ip")
+    # российское и прочее из стоп-списка не добавится никогда — и проверять
+    # незачем: на загруженной сети это половина кандидатов (yandex, .ru)
+    [ -n "$dom" ] && [ -n "$NEVER" ] && echo "$dom" | grep -qEi "$NEVER" && return 0
     old=$(verdict_line "$ip" "${dom:--}")
     if [ -n "$old" ]; then
         last=$(echo "$old" | cut -d'|' -f6)
         wait=$RECHECK
         case "$(echo "$old" | cut -d'|' -f3-5)" in
-            "ЗАБЛОКИРОВАН|0|"*|"ЗАБЛОКИРОВАН|1|"*) wait=900 ;;
-            лежит\|*) [ "$(echo "$old" | cut -d'|' -f5)" = "$last" ] && wait=900 ;;
+            # свежий признак из трафика (человек снова открыл сайт) — сам по
+            # себе независимое подтверждение: ждём минуту, а не CONFIRM_AFTER
+            "ЗАБЛОКИРОВАН|0|"*|"ЗАБЛОКИРОВАН|1|"*)
+                if [ "$why" = обход ]; then wait=$CONFIRM_AFTER; else wait=$CONFIRM_SYMPTOM; fi ;;
+            лежит\|*) [ "$(echo "$old" | cut -d'|' -f5)" = "$last" ] && wait=$CONFIRM_AFTER ;;
+            # «живой», а соединения к нему снова рвутся или молчат — значит,
+            # кто-то дома натыкается на это сейчас; 6 часов не ждём
+            живой\|*) [ "$why" != обход ] && wait=$ALIVE_RECHECK ;;
         esac
         [ $((now - last)) -lt "$wait" ] && return 0
     fi
 
     # shellcheck disable=SC2046  # probe печатает три кода через пробел
-    set -- $(probe "$ip" "$dom")
+    set -- $(probe "$ip" "$dom" "$why")
     v=$(verdict_of "$1" "$2" "$3")
     codes="$1/$2/$3"
     checked=$((checked + 1)); checked_run=$((checked_run + 1))
 
     hits=$(echo "$old" | cut -d'|' -f4); [ -n "$hits" ] || hits=0
     first=$(echo "$old" | cut -d'|' -f5); [ -n "$first" ] || first=$now
-    if [ "$v" = "ЗАБЛОКИРОВАН" ]; then hits=$((hits + 1)); else hits=0; fi
+    # Напрямую по-прежнему нет, но не ответил и туннель — это ничего не
+    # доказывает, и набранное совпадение сбрасывать нельзя: сбрасывает только
+    # ответ напрямую. На grisha туннель выходит через нестабильный выход, и
+    # cdn.db.io терял первое совпадение на 200~/200~/000~. Держим «1 из 2» на
+    # один такой раз — если туннель не ответил и в прошлый, сдаёмся.
+    if [ "$v" = "лежит" ] && [ "$(echo "$old" | cut -d'|' -f3)" = "ЗАБЛОКИРОВАН" ] &&
+       ok "$(echo "$old" | cut -d'|' -f8 | cut -d/ -f3)"; then
+        v="ЗАБЛОКИРОВАН"
+    elif [ "$v" = "ЗАБЛОКИРОВАН" ]; then hits=$((hits + 1))
+    else hits=0
+    fi
 
     awk -F'|' -v ip="$ip" -v d="${dom:--}" '!($1 == ip && $2 == d)' "$DIR/verdicts" 2>/dev/null > "$DIR/v.tmp"
     echo "$ip|${dom:--}|$v|$hits|$first|$now|$why|$codes" >> "$DIR/v.tmp"
@@ -633,7 +854,8 @@ sweep_filter() {   # файл «адрес имя» -> кандидаты для
 # Обход имён, которые в доме уже открывали: ловит блокировки без следов в ядре.
 # Свежие имена — первыми, остальные вперемешку. Российские, завёрнутые в
 # туннель и уже проверенные пропускаются.
-sweep() {
+sweep() {   # [сколько проверок, по умолчанию сколько влезет в шаг]
+    _slim=${1:-$MAX_TICK}; _s0=$checked
     tail -400 "$DIR/ipmap" |
         awk '{ a[NR] = $0 } END { for (i = NR; i >= 1; i--) print a[i] }' > "$DIR/recent"
     { sweep_filter "$DIR/recent"
@@ -641,6 +863,7 @@ sweep() {
           awk 'BEGIN { srand() } { print rand(), $0 }' | sort -n | cut -d' ' -f2-
     } | awk '!s[$2]++' | head -20 > "$DIR/sweep"
     while read -r sip sdom; do
+        [ $((checked - _s0)) -ge "$_slim" ] && break
         check_one "$sip" "обход" "$sdom" || break
     done < "$DIR/sweep"
 }
@@ -845,6 +1068,16 @@ status_json() {
             printf '%s\t%s %s\t%s\n' "$d" "$a1" "$a2" "$l"
         done | jq -R -s 'split("\n") | map(select(length > 0) | split("\t") |
                          { domain: .[0], at: .[1], live: (.[2] == "true") }) | reverse')
+    # итог последней перепроверки к каждому домену списка
+    touch "$LISTED" 2>/dev/null
+    _listed=$(jq -R -s 'split("\n") | map(select(length > 0) | split("|") |
+                  { key: .[0], value: { checked_at: (.[1] | tonumber? // 0),
+                    streak: (.[2] | tonumber? // 0), codes: .[3], result: .[4] } }) | from_entries' \
+                  "$LISTED")
+    _added=$(echo "$_added" | jq --argjson l "$_listed" 'map(. + ($l[.domain] // {}))')
+    _removed=$(grep ' УБРАН ' "$LOG" 2>/dev/null | tail -20 |
+        awk '{ print $1 " " $2 "\t" $4 }' | jq -R -s 'split("\n") | map(select(length > 0) |
+            split("\t") | { at: .[0], domain: .[1] }) | reverse')
     _counts=$(awk -F'|' '{ n[$3]++ } END { printf "%d %d %d", NR, n["живой"], n["лежит"] }' "$DIR/verdicts")
     set -- $_counts
     if scan_running; then _run=true; else _run=false; fi
@@ -862,13 +1095,15 @@ status_json() {
           --argjson found "$_found" --argjson pending "$_pend" --argjson added "$_added" \
           --argjson checked "${1:-0}" --argjson alive "${2:-0}" --argjson down "${3:-0}" \
           --argjson running "$_run" --argjson apply "$_apply" --argjson tunnel "$_tun" \
-          --argjson wired "$_wired" \
+          --argjson wired "$_wired" --argjson removed "$_removed" \
+          --argjson recheck "{\"auto_remove\": $([ "$AUTO_REMOVE" = 1 ] && echo true || echo false), \"hours\": $((RECHECK_LISTED / 3600)), \"remove_after\": $REMOVE_AFTER}" \
           --argjson problems "$(problems | json_lines)" \
           '{version: $version, backend: $backend, file: $file,
             hooked: ($section != ""), section: $section, wired: $wired,
             checked: $checked, alive: $alive, down: $down, running: $running,
             tunnel: $tunnel, apply: $apply, problems: $problems,
-            added: $added, found: $found, pending: $pending}'
+            added: $added, found: $found, pending: $pending,
+            removed: $removed, recheck: $recheck}'
 }
 
 report() {
