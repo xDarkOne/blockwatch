@@ -56,6 +56,13 @@ cfg() { _v=$(uci -q get "$CONFIG.main.$1"); echo "${_v:-$2}"; }
 DOMAINS_FILE=$(cfg domains_file /etc/blockwatch/domains.txt)
 AUTO_EXPORT=$(cfg auto_export 1)
 MAX_DAY=$(cfg max_per_day 30)
+# Предел списка: на тесных роутерах свободно ~1,5 МБ флеша, а список и
+# журнал иначе росли бы без конца. По достижении новые домены не добавляются
+# (с предупреждением), старые сами не удаляются — иначе заблокированный сайт
+# мог бы молча перестать открываться.
+MAX_TOTAL=$(cfg max_domains 500)
+LOG_KEEP=500       # строк журнала находок
+STATE_EVERY=3600   # как часто сохранять вердикты на флеш, секунд
 
 # --- бэкенд: netshift, podkop или совместимый -------------------------------
 # Всё, что отличает их друг от друга, берём из их же constants.sh, а не
@@ -512,9 +519,30 @@ scan() {
   done
 
     tail -400 "$DIR/verdicts" > "$DIR/v.trim" && mv "$DIR/v.trim" "$DIR/verdicts"
-    mkdir -p "$STATE_DIR"
-    same_file "$DIR/verdicts" "$STATE" || cp -f "$DIR/verdicts" "$STATE"
+    save_state
 }
+
+# Вердикты меняются почти каждый заход (раз в 2 минуты), а на флеш их стоит
+# писать редко: раз в час или сразу после подтверждённой находки. Между
+# сохранениями они живут в ОЗУ; перезагрузка потеряет не больше часа проверок.
+save_state() {
+    mkdir -p "$STATE_DIR"
+    same_file "$DIR/verdicts" "$STATE" && return 0
+    if [ -f "$STATE" ] && [ ! -f "$DIR/state.dirty" ]; then
+        _saved=$(date -r "$STATE" +%s 2>/dev/null || echo 0)
+        [ $(($(date +%s) - _saved)) -lt "$STATE_EVERY" ] && return 0
+    fi
+    cp -f "$DIR/verdicts" "$STATE" && rm -f "$DIR/state.dirty"
+}
+
+log_find() {   # строка в журнал находок; журнал не растёт дальше LOG_KEEP строк
+    mkdir -p "$STATE_DIR"
+    echo "$(date '+%Y-%m-%d %H:%M') $*" >> "$LOG"
+    [ "$(wc -l < "$LOG")" -gt $((LOG_KEEP + 100)) ] || return 0
+    tail -n "$LOG_KEEP" "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+}
+
+domains_count() { grep -cvE '^[[:space:]]*(#|$)' "$DOMAINS_FILE" 2>/dev/null || true; }
 
 # Что перепроверить через 15 минут, не дожидаясь RECHECK: недоподтверждённые
 # блокировки и «лежит», проверенное лишь раз по признаку в трафике. Во втором
@@ -581,9 +609,9 @@ check_one() {   # адрес, признак, [имя]
     mv "$DIR/v.tmp" "$DIR/verdicts"
 
     if [ "$v" = "ЗАБЛОКИРОВАН" ] && [ "$hits" -eq 2 ]; then
-        mkdir -p "$STATE_DIR"
-        echo "$(date '+%Y-%m-%d %H:%M') ПОДТВЕРЖДЕНО $ip ${dom:-без-имени} признак=$why коды=$codes" >> "$LOG"
+        log_find "ПОДТВЕРЖДЕНО $ip ${dom:-без-имени} признак=$why коды=$codes"
         logger -t blockwatch "подтверждена блокировка $ip ${dom:-без-имени}"
+        touch "$DIR/state.dirty"   # находку сохраняем на флеш, не дожидаясь часа
     fi
     return 0
 }
@@ -688,6 +716,13 @@ export_domains() {   # [auto]
     mkdir -p "$(dirname "$DOMAINS_FILE")" "$STATE_DIR"; touch "$DOMAINS_FILE"
     _today=$(grep -c "^$(date '+%Y-%m-%d') .*ДОБАВЛЕН" "$LOG" 2>/dev/null); _today=${_today:-0}
     _room=$((MAX_DAY - _today)); [ "$_room" -gt "$MAX_EXPORT" ] && _room=$MAX_EXPORT
+    _left=$((MAX_TOTAL - $(domains_count))); [ "$_room" -gt "$_left" ] && _room=$_left
+    if [ "$_left" -le 0 ]; then
+        [ -n "$(pending | head -1)" ] &&
+            logger -t blockwatch "список достиг предела $MAX_TOTAL доменов, новые не добавляются"
+        jq -n '{added: [], applied: false, mode: "full", message: "список доменов полон"}'
+        return 0
+    fi
     if [ "$_room" -le 0 ]; then
         [ -n "$(pending | head -1)" ] &&
             logger -t blockwatch "дневной предел $MAX_DAY доменов исчерпан, перенос отложен"
@@ -705,7 +740,7 @@ export_domains() {   # [auto]
         echo "$_add"
     } >> "$DOMAINS_FILE"
     for d in $_add; do
-        echo "$(date '+%Y-%m-%d %H:%M') ДОБАВЛЕН $d" >> "$LOG"
+        log_find "ДОБАВЛЕН $d"
     done
     logger -t blockwatch "добавлено в список: $(echo $_add)"
 
@@ -781,6 +816,8 @@ problems() {   # по строке на проблему
     if hooked_up && ! live_ruleset >/dev/null; then
         echo "файл подключён, но $BACKEND ещё не собрал из него список — перезапусти $BACKEND один раз"
     fi
+    [ "$(domains_count)" -ge "$MAX_TOTAL" ] &&
+        echo "список доменов достиг предела $MAX_TOTAL — новые не добавляются: почисти $DOMAINS_FILE или подними blockwatch.main.max_domains"
     if live_ruleset >/dev/null && ! ruleset_wired; then
         echo "$BACKEND собрал sing-box без списка blockwatch: домены из него сейчас не идут в туннель — перезапусти $BACKEND"
     fi

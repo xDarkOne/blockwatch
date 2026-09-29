@@ -226,6 +226,37 @@ sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; forget_blind_down'
 check "чистка только один раз" grep -q new.example.com /tmp/blockwatch/verdicts
 rm -f /tmp/blockwatch/verdicts /etc/blockwatch/verdicts.v
 
+echo "== пределы: список, журнал, запись на флеш"
+printf '# шапка\na.example\nb.example\nc.example\n' > /tmp/bw-dom.txt
+E=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; DOMAINS_FILE=/tmp/bw-dom.txt; MAX_TOTAL=3
+    pending() { echo new.example; }; export_domains auto | jq -r .mode')
+check "полный список: новые не добавляются" test "$E" = full
+check "полный список: файл не тронут" sh -c "! grep -q new.example /tmp/bw-dom.txt"
+Q=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; DOMAINS_FILE=/tmp/bw-dom.txt; MAX_TOTAL=3; problems')
+check "полный список: предупреждение" sh -c "echo \"\$0\" | grep -q 'достиг предела 3'" "$Q"
+Q=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; DOMAINS_FILE=/tmp/bw-dom.txt; MAX_TOTAL=4; problems')
+check "есть место: без предупреждения" sh -c "! echo \"\$0\" | grep -q 'достиг предела'" "$Q"
+rm -f /tmp/bw-dom.txt
+sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; LOG=/tmp/bw-log.txt; LOG_KEEP=5
+    for i in $(seq 1 106); do log_find "запись $i"; done'
+check "журнал обрезан до LOG_KEEP" test "$(wc -l < /tmp/bw-log.txt)" = 5
+check "в журнале остались последние" grep -q 'запись 106$' /tmp/bw-log.txt
+rm -f /tmp/bw-log.txt
+mkdir -p /tmp/blockwatch /tmp/bw-st
+echo "1.2.3.4|old.example|живой|0|1|1|обход|200/-/-" > /tmp/bw-st/verdicts
+echo "1.2.3.4|new.example|живой|0|2|2|обход|200/-/-" > /tmp/blockwatch/verdicts
+S='. /usr/bin/blockwatch >/dev/null 2>&1; STATE_DIR=/tmp/bw-st; STATE=/tmp/bw-st/verdicts'
+sh -c "$S; save_state"
+check "свежее сохранение: на флеш не пишем" grep -q old.example /tmp/bw-st/verdicts
+touch /tmp/blockwatch/state.dirty
+sh -c "$S; save_state"
+check "после находки: пишем сразу" grep -q new.example /tmp/bw-st/verdicts
+check "метка находки снята" test ! -f /tmp/blockwatch/state.dirty
+echo "1.2.3.4|newer.example|живой|0|3|3|обход|200/-/-" > /tmp/blockwatch/verdicts
+sh -c "$S; STATE_EVERY=0; save_state"
+check "прошёл час: пишем" grep -q newer.example /tmp/bw-st/verdicts
+rm -rf /tmp/bw-st /tmp/blockwatch/verdicts
+
 echo "== hook / unhook"
 blockwatch hook main >/dev/null 2>&1
 check "hook добавил путь" sh -c "uci -q get netshift.main.local_domain_lists | grep -q /etc/blockwatch/domains.txt"
