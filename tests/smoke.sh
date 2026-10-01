@@ -136,6 +136,12 @@ S=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; stalled_flows /tmp/bw-f0 /tmp/
 rm -f /tmp/bw-f0 /tmp/bw-f1 /tmp/bw-f2
 check "страница встала на 20 КБ в двух соединениях — обрыв" sh -c "echo \"\$0\" | grep -q '216.150.1.65 обрыв'" "$S"
 check "одно такое соединение — не в счёт" sh -c "! echo \"\$0\" | grep -q 216.150.1.66" "$S"
+# установлено, отправили 11 КБ, от сервера только 60 байт — обрыв сразу, в том же шаге
+printf '%s\n' 'r 216.150.16.65 10 11044 60' 's 203.0.113.88 3 400 60' > /tmp/bw-f1; cp /tmp/bw-f1 /tmp/bw-f2; : > /tmp/bw-f0
+S=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; stalled_flows /tmp/bw-f0 /tmp/bw-f1 /tmp/bw-f2' | sort | tr '\n' ';')
+rm -f /tmp/bw-f0 /tmp/bw-f1 /tmp/bw-f2
+check "не ответили даже на TLS — обрыв" sh -c "echo \"\$0\" | grep -q '216.150.16.65 обрыв'" "$S"
+check "почти ничего не отправили — не в счёт" sh -c "! echo \"\$0\" | grep -q 203.0.113.88" "$S"
 # стоп-список: кандидат с российским именем не проверяется вовсе
 : > /tmp/bw-probed
 sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; build_never; checked=0; checked_run=0; now=10000
