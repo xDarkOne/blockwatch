@@ -166,6 +166,13 @@ proxy_servers() {
 build_never() {
     _list=$(uci -q get "$CONFIG.main.never_suffix")
     [ -n "$_list" ] || _list="ru su xn--p1ai googlevideo.com gvt1.com"
+    # YouTube — никогда, даже если never_suffix в настройках задан свой: его
+    # почти везде обслуживает отдельный обход (zapret, bytetube, byedpi), а с
+    # роутера напрямую он не открывается — и blockwatch счёл бы его
+    # заблокированным. Так 05.10 на домашнем роутере www.youtube.com ушёл в
+    # AWG2 мимо bytetube. Разрешить: allow_youtube=1.
+    [ "$(cfg allow_youtube 0)" = 1 ] ||
+        _list="$_list youtube.com ytimg.com ggpht.com youtu.be youtube-nocookie.com googlevideo.com"
     for _h in $(proxy_servers); do
         case "$_h" in
             *[!0-9.]*) _list="$_list $_h $(echo "$_h" | awk -F. 'NF >= 2 { print $(NF-1) "." $NF }')" ;;
@@ -1279,20 +1286,27 @@ heal_hook() {
         done
     done
     if [ -z "$_fix" ]; then
-        # в настройках всё есть — а в собранном sing-box?
-        if live_ruleset >/dev/null && ! ruleset_wired; then
+        # в настройках всё есть — а в собранном sing-box? Набора может не быть
+        # вовсе (бэкенд собрался, пока списков в настройках не было) или он
+        # есть, но конфиг на него не ссылается. Ждём, пока конфиг не постоит
+        # пару минут, — чтобы не влезть в идущий перезапуск.
+        if ! { live_ruleset >/dev/null && ruleset_wired; } || ! subnets_wired; then
             _age=$(( $(date +%s) - $(date -r "$SB_CONFIG" +%s 2>/dev/null || echo 0) ))
-            [ "$_age" -gt 300 ] && _fix=" не собрано в sing-box"
+            [ "$_age" -gt 120 ] && _fix=" не собрано в sing-box"
         fi
         [ -n "$_fix" ] || return 0
     fi
     uci commit "$BACKEND"
-    _last=$(date -r "$DIR/rehook.at" +%s 2>/dev/null || echo 0)
-    if [ $(( $(date +%s) - _last )) -lt 1800 ]; then
-        logger -t blockwatch "списки возвращены в $BACKEND.$_hs, перезапуск отложен (был меньше 30 мин назад)"
+    # не больше трёх перезапусков в час: на обычные сохранения в Forkozz
+    # хватает, а зациклиться, если что-то упорно удаляет списки, не даст
+    _now=$(date +%s)
+    awk -v n="$_now" 'n - $1 < 3600' "$DIR/rehook.times" 2>/dev/null > "$DIR/rehook.t" || true
+    mv "$DIR/rehook.t" "$DIR/rehook.times" 2>/dev/null
+    if [ "$(wc -l < "$DIR/rehook.times")" -ge 3 ]; then
+        logger -t blockwatch "списки в $BACKEND.$_hs возвращены, но перезапусков за час уже три — жду"
         return 0
     fi
-    touch "$DIR/rehook.at"
+    echo "$_now" >> "$DIR/rehook.times"
     log_find "ВОССТАНОВЛЕНО подключение к $BACKEND.$_hs:$_fix — перезапускаю $BACKEND"
     ( trap "" HUP; /usr/bin/blockwatch apply-bg >/dev/null 2>&1 & ) </dev/null
 }

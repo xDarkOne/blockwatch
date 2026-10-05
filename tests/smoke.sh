@@ -109,6 +109,14 @@ if [ -z "$N" ]; then fail "стоп-список пуст"; else pass "стоп-
 for d in grani.ru www.gosuslugi.ru x.xn--p1ai r1.googlevideo.com vpn.example.net cdn.example.net; do
     check "не добавлять $d" sh -c "echo $d | grep -qEi '$N'"
 done
+uci add_list blockwatch.main.never_suffix=ru; uci commit blockwatch
+N2=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; build_never; echo "$NEVER"')
+for d in www.youtube.com i.ytimg.com yt3.ggpht.com youtu.be; do
+    check "YouTube никогда, даже со своим never_suffix: $d" sh -c "echo $d | grep -qEi '$N2'"
+done
+N3=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; uci set blockwatch.main.allow_youtube=1; build_never; echo "$NEVER"')
+check "allow_youtube=1 — можно" sh -c "! echo www.youtube.com | grep -qEi '$N3'"
+uci -q delete blockwatch.main.never_suffix; uci -q delete blockwatch.main.allow_youtube; uci commit blockwatch
 for d in discord.com linkmydroid.com rsc.cdn77.org example.com; do
     check "можно добавлять $d" sh -c "! echo $d | grep -qEi '$N'"
 done
@@ -541,7 +549,7 @@ uci add_list netshift.main.remote_subnet_lists=/etc/blockwatch/subnets.txt
 uci add_list netshift.main.zm_refs=l:/etc/blockwatch/domains.txt
 uci add_list netshift.main.zm_refs=s:https://example.com/list.txt
 uci commit netshift
-rm -f /tmp/blockwatch/rehook.at
+rm -f /tmp/blockwatch/rehook.times
 H='. /usr/bin/blockwatch >/dev/null 2>&1; apply_bg() { :; }'
 sh -c "$H; heal_hook"
 check "вернул список доменов" sh -c "uci -q get netshift.main.local_domain_lists | grep -q /etc/blockwatch/domains.txt"
@@ -549,11 +557,21 @@ check "вернул список адресов" sh -c "uci -q get netshift.main
 check "убрал свои пути из remote-списков" sh -c "! uci -q get netshift.main.remote_domain_lists | grep -q blockwatch && ! uci -q get netshift.main.remote_subnet_lists | grep -q blockwatch"
 check "чужое в remote-списках не тронул" sh -c "uci -q get netshift.main.remote_domain_lists | grep -q example.com/list.txt && uci -q get netshift.main.zm_refs | grep -q 's:https://example.com'"
 check "убрал свои пути из zm_refs" sh -c "! uci -q get netshift.main.zm_refs | grep -q blockwatch"
-check "записал в журнал и отметил перезапуск" sh -c "grep -q 'ВОССТАНОВЛЕНО подключение к netshift.main' /etc/blockwatch/blockwatch.log && test -f /tmp/blockwatch/rehook.at"
+check "записал в журнал и отметил перезапуск" sh -c "grep -q 'ВОССТАНОВЛЕНО подключение к netshift.main' /etc/blockwatch/blockwatch.log && test \$(wc -l < /tmp/blockwatch/rehook.times) = 1"
+# Forkozz сохранили ещё раз — снова перезапуск (до трёх в час), четвёртый ждёт
+for _ in 2 3; do uci -q delete netshift.main.local_domain_lists; uci commit netshift; sh -c "$H; heal_hook"; done
+check "второе и третье сохранение — перезапуск" test "$(wc -l < /tmp/blockwatch/rehook.times)" = 3
 uci -q delete netshift.main.local_domain_lists; uci commit netshift
-L1=$(grep -c ВОССТАНОВЛЕНО /etc/blockwatch/blockwatch.log)
 sh -c "$H; heal_hook"
-check "через минуту снова удалили — вернул, но без перезапуска" sh -c "uci -q get netshift.main.local_domain_lists | grep -q blockwatch && test $(grep -c ВОССТАНОВЛЕНО /etc/blockwatch/blockwatch.log) = $L1"
+check "четвёртый за час — списки вернул, перезапуск ждёт" sh -c "uci -q get netshift.main.local_domain_lists | grep -q blockwatch && test \$(wc -l < /tmp/blockwatch/rehook.times) = 3"
+rm -f /tmp/blockwatch/rehook.times
+# в настройках есть, а наборов нет — лечится, когда конфиг постоял
+touch -d '2026-01-01 00:00' /etc/sing-box/config.json
+sh -c "$H; heal_hook"
+check "в настройках есть, наборов нет — перезапуск" test "$(wc -l < /tmp/blockwatch/rehook.times 2>/dev/null)" = 1
+rm -f /tmp/blockwatch/rehook.times; touch /etc/sing-box/config.json
+sh -c "$H; heal_hook"
+check "…но не сразу после сборки" test ! -s /tmp/blockwatch/rehook.times
 uci -q delete netshift.main.local_domain_lists; uci commit netshift
 sh -c "$H; AUTO_REHOOK=0; heal_hook"
 check "auto_rehook=0 — не трогает" sh -c "! uci -q get netshift.main.local_domain_lists"
@@ -567,7 +585,7 @@ sh -c "$H; heal_hook"
 check "перенос: метка по текущему подключению" grep -qx main /etc/blockwatch/hooked
 uci -q delete netshift.main.local_domain_lists; uci -q delete netshift.main.local_subnet_lists
 uci -q delete netshift.main.remote_domain_lists; uci -q delete netshift.main.remote_subnet_lists; uci -q delete netshift.main.zm_refs
-uci commit netshift; rm -f /etc/blockwatch/hooked /tmp/blockwatch/rehook.at
+uci commit netshift; rm -f /etc/blockwatch/hooked /tmp/blockwatch/rehook.times
 
 
 echo "== podkop"
