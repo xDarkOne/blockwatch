@@ -51,7 +51,9 @@ INNER='
         mount --bind "/dev/$n" "$R/dev/$n"
     done
     mount --rbind /proc "$R/proc"
-    chroot "$R" /bin/sh -c "BW_SRC=/src sh /src/tests/smoke.sh"
+    # PATH — свой, как на роутере: на хосте может не быть /sbin (CachyOS),
+    # и тогда uci «не найден»
+    chroot "$R" /bin/sh -c "export PATH=/usr/sbin:/usr/bin:/sbin:/bin; BW_SRC=/src sh /src/tests/smoke.sh"
 '
 case "$RUN" in
     "")   unshare -m sh -c "$INNER" _ "$ROOT" ;;

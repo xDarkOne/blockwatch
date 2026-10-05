@@ -140,11 +140,12 @@ case "$1" in
         /usr/bin/blockwatch doctor || true
         echo
         if /usr/bin/blockwatch status 2>/dev/null | jq -e '.hooked' >/dev/null 2>&1; then
-            say "Файл доменов уже подключён. Смотри, что происходит: LuCI → Службы → Blockwatch"
+            say "Списки уже подключены. Смотри, что происходит: LuCI → Службы → Blockwatch"
         else
             say "Дальше:"
-            say "  1. подключи файл доменов к netshift/podkop:  blockwatch hook main"
-            say "     (или вручную: секция → Local Domain Lists → /etc/blockwatch/domains.txt)"
+            say "  1. подключи списки доменов и адресов к netshift/podkop:  blockwatch hook main"
+            say "     (или вручную: секция → Local Domain Lists → /etc/blockwatch/domains.txt"
+            say "      и Local Subnet Lists → /etc/blockwatch/subnets.txt)"
             say "  2. смотри, что происходит: LuCI → Службы → Blockwatch"
         fi
         ;;

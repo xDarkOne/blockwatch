@@ -53,6 +53,10 @@ config blockwatch 'main'
 	# Ручная настройка — только если автоопределение не справилось
 	# (посмотреть, что определилось: blockwatch doctor)
 	#option socks '127.0.0.1:4534'
+	# если socks-входа нет (загрузка списков через прокси выключена):
+	# проверять «через туннель» через этот интерфейс; по умолчанию — интерфейс
+	# секции netshift/podkop типа vpn
+	#option tunnel_interface 'AWG2'
 	#option dns '127.0.0.42'
 	#option fakeip_range '198.18.0.0/15'
 	#option fakeip_mark '0x00100000'

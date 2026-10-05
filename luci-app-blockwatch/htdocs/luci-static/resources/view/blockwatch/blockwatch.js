@@ -140,12 +140,37 @@ function tiles(state, st) {
 	]);
 }
 
-function problemsBlock(st) {
+function tunnelLabel(p) {
+	return /^if:/.test(p || '') ? 'интерфейс ' + p.slice(3) : 'socks-вход ' + p;
+}
+
+// Списки отключены — частый случай: Zapret-Manager, переустанавливая netshift,
+// переписывает его настройки целиком. Кнопка делает то же, что blockwatch hook.
+function hookButton(state, st) {
+	if (!st.backend || (st.hooked && st.ips_hooked !== false))
+		return '';
+	return E('p', {}, E('button', {
+		'class': 'cbi-button cbi-button-action',
+		'click': function (ev) {
+			if (!window.confirm('Подключить списки blockwatch к ' + backendName(st) + '? ' + backendName(st) +
+					' перезапустится один раз — соединения прервутся секунд на двадцать.'))
+				return;
+			ev.target.disabled = true;
+			return fs.exec('/usr/bin/blockwatch', ['hook']).then(function (res) {
+				ui.addNotification(null, E('p', {}, (res && (res.stdout || res.stderr)) || 'готово'));
+				return state.reload();
+			});
+		}
+	}, 'Подключить списки к ' + backendName(st)));
+}
+
+function problemsBlock(state, st) {
 	if (!st.problems || !st.problems.length)
 		return '';
 	return E('div', { 'class': 'alert-message warning' },
 		[E('strong', {}, 'Требует внимания:')].concat(
-			st.problems.map(function (p) { return E('div', {}, '— ' + p); })));
+			st.problems.map(function (p) { return E('div', {}, '— ' + p); }),
+			[hookButton(state, st)]));
 }
 
 // --- вкладки ---------------------------------------------------------------------
@@ -156,7 +181,7 @@ function overviewTab(state, st) {
 		st.hooked ? E('p', {}, ['Списки подключены к ' + backendName(st) + ', секция «' + st.section + '»: ',
 			E('code', {}, st.file), st.ips_hooked ? ' и адреса' : '']) : '',
 		st.tunnel ? E('p', {}, st.tunnel.ok
-			? 'Туннель для проверки: ' + st.tunnel.socks + ' (выход ' + st.tunnel.tunnel + ', напрямую ' + st.tunnel.direct + ')'
+			? 'Туннель для проверки: ' + tunnelLabel(st.tunnel.socks) + ' (выход ' + st.tunnel.tunnel + ', напрямую ' + st.tunnel.direct + ')'
 			: 'Туннель для проверки не найден.') : '',
 		st.apply ? E('p', {}, [E('strong', {}, 'Последнее добавление (' + st.apply.at + '): '), st.apply.message]) : '',
 		E('h4', {}, 'Недавно добавлено')
@@ -400,7 +425,7 @@ return view.extend({
 		state.refresh = function () {
 			var s = state.data;
 			head.innerHTML = '';
-			put(head, problemsBlock(s));
+			put(head, problemsBlock(state, s));
 			put(head, tiles(state, s));
 			Object.keys(RENDER).forEach(function (k) {
 				bodies[k].innerHTML = '';

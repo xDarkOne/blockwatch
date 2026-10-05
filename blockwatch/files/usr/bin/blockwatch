@@ -208,27 +208,48 @@ proxy_ips() {
 # У netshift и podkop служебный вход service-mixed-in есть только при включённой
 # загрузке списков через прокси, поэтому ищем любой mixed/socks-вход, а потом
 # убеждаемся делом, что через него выход действительно другой.
-detect_socks() {
+detect_socks() {   # путь «через туннель»: socks-вход sing-box или интерфейс VPN-секции
+    # $SOCKS — то, что видно в статусе: «адрес:порт» или «if:<интерфейс>»;
+    # TUN_OPT/TUN_VAL — как сказать это curl.
+    TUN_OPT=""; TUN_VAL=""
     SOCKS=$(cfg socks "")
-    [ -n "$SOCKS" ] && return 0
-    [ -f "$SB_CONFIG" ] || return 1
-    # shellcheck disable=SC2046  # ответ jq — два слова, разбиение нужно
-    set -- $(jq -r '
-        [.inbounds[]? | select((.type == "mixed" or .type == "socks")
-                               and .listen != null and .listen_port != null)] as $in
-        | (($in | map(select(.tag == "service-mixed-in"))) + $in) | first
-        | if . then "\(.listen) \(.listen_port)" else empty end' "$SB_CONFIG" 2>/dev/null)
-    [ -n "$2" ] || return 1
-    case "$1" in
-        0.0.0.0|::|"") SOCKS="127.0.0.1:$2" ;;
-        *:*)           SOCKS="[$1]:$2" ;;
-        *)             SOCKS="$1:$2" ;;
-    esac
+    if [ -z "$SOCKS" ] && [ -f "$SB_CONFIG" ]; then
+        # shellcheck disable=SC2046  # ответ jq — два слова, разбиение нужно
+        set -- $(jq -r '
+            [.inbounds[]? | select((.type == "mixed" or .type == "socks")
+                                   and .listen != null and .listen_port != null)] as $in
+            | (($in | map(select(.tag == "service-mixed-in"))) + $in) | first
+            | if . then "\(.listen) \(.listen_port)" else empty end' "$SB_CONFIG" 2>/dev/null)
+        if [ -n "$2" ]; then
+            case "$1" in
+                0.0.0.0|::|"") SOCKS="127.0.0.1:$2" ;;
+                *:*)           SOCKS="[$1]:$2" ;;
+                *)             SOCKS="$1:$2" ;;
+            esac
+        fi
+    fi
+    if [ -n "$SOCKS" ]; then TUN_OPT=-x; TUN_VAL="socks5://$SOCKS"; return 0; fi
+    # Socks-вход у netshift/podkop есть только при «загрузке списков через
+    # прокси» — а Zapret-Manager, ставя netshift, эту настройку выключает. Для
+    # секции типа vpn туннель — просто интерфейс: curl --interface, как ходит
+    # и сам sing-box (bind_interface).
+    _tif=$(cfg tunnel_interface "")
+    if [ -z "$_tif" ] && [ -n "$BACKEND" ]; then
+        for _sec in $(hooked_section) main $(uci show "$BACKEND" 2>/dev/null |
+                sed -n "s/^$BACKEND\.\([A-Za-z0-9_]*\)\.connection_type='vpn'$/\1/p"); do
+            [ "$(uci -q get "$BACKEND.$_sec.connection_type")" = vpn ] || continue
+            _tif=$(uci -q get "$BACKEND.$_sec.interface"); [ -n "$_tif" ] && break
+        done
+    fi
+    [ -n "$_tif" ] && ip link show "$_tif" >/dev/null 2>&1 || return 1
+    SOCKS="if:$_tif"; TUN_OPT=--interface; TUN_VAL=$_tif
 }
 
-exit_ip() {   # [socks] -> внешний адрес
+exit_ip() {   # [путь: адрес:порт socks или if:<интерфейс>] -> внешний адрес
     for _u in https://ifconfig.me/ip https://api.ipify.org https://icanhazip.com; do
-        if [ -n "$1" ]; then
+        if [ -n "${1#if:}" ] && [ "${1#if:}" != "$1" ]; then
+            _ip=$(curl -4 -s -m 8 --interface "${1#if:}" "$_u" 2>/dev/null | tr -d ' \r\n')
+        elif [ -n "$1" ]; then
             _ip=$(curl -4 -s -m 8 -x "socks5h://$1" "$_u" 2>/dev/null | tr -d ' \r\n')
         else
             _ip=$(curl -4 -s -m 8 "$_u" 2>/dev/null | tr -d ' \r\n')
@@ -514,14 +535,14 @@ probe() {   # адрес, [имя], [признак] -> «сайт адрес т
                 ok "$_w" && { echo "$_w - -"; return; } ;;
         esac
         _d=$(get 7 "https://$_dom/" --resolve "$_dom:443:$_ip")
-        _v=$(get 10 "https://$_dom/" --resolve "$_dom:443:$_ip" -x "socks5://$SOCKS")
+        _v=$(get 10 "https://$_dom/" --resolve "$_dom:443:$_ip" "$TUN_OPT" "$TUN_VAL")
     else
         # без имени блокировку по SNI не воспроизвести: проверяем одинаково
         # оба пути по адресу, и вывод получается осторожным
         _d=$(get 7 "https://$_ip/" -k)
         _w=$_d
         ok "$_w" && { echo "$_w $_d -"; return; }
-        _v=$(get 10 "https://$_ip/" -k -x "socks5://$SOCKS")
+        _v=$(get 10 "https://$_ip/" -k "$TUN_OPT" "$TUN_VAL")
     fi
     echo "$_w $_d $_v"
 }
@@ -1248,9 +1269,9 @@ problems() {   # по строке на проблему
         read -r _ts _ok _d _t _s < "$DIR/tunnel"
         if [ "$_ok" != 1 ]; then
             if [ "${_s:--}" = - ]; then
-                echo "не найден socks-вход sing-box: включи в $BACKEND загрузку списков через прокси"
+                echo "проверять через туннель нечем: нет ни socks-входа sing-box, ни секции $BACKEND типа vpn — включи в $BACKEND загрузку списков через прокси или задай blockwatch.main.tunnel_interface"
             else
-                echo "через socks-вход $_s выход тот же, что напрямую ($_d) — это не туннель"
+                echo "через $_s выход тот же, что напрямую ($_d) — это не туннель"
             fi
         fi
     fi
@@ -1499,7 +1520,11 @@ doctor() {
     echo "DNS sing-box:  $DNS, fakeip $FAKEIP_RANGE"
     echo "конфиг:        $SB_CONFIG"
     echo "наборы:        $RULESET_DIR"
-    detect_socks && echo "socks-вход:    $SOCKS" || echo "socks-вход:    не найден"
+    if detect_socks; then
+        case "$SOCKS" in if:*) echo "путь в туннель: интерфейс ${SOCKS#if:}" ;; *) echo "путь в туннель: socks-вход $SOCKS" ;; esac
+    else
+        echo "путь в туннель: не найден (ни socks-входа, ни VPN-секции)"
+    fi
     echo "выход в сеть:  $(wan_devs | tr '\n' ' ')"
     printf "туннель:       "
     if tunnel_check force; then
@@ -1507,7 +1532,7 @@ doctor() {
         echo "есть ($_d напрямую, $_t через туннель)"
     else
         read -r _ts _ok _d _t _s < "$DIR/tunnel"
-        echo "НЕТ ($_d напрямую, ${_t:--} через socks)"
+        echo "НЕТ ($_d напрямую, ${_t:--} через туннель)"
     fi
     echo "файл доменов:  $DOMAINS_FILE, секция: $(hooked_section || true)"
     echo "живой список:  $(live_ruleset || echo нет)"

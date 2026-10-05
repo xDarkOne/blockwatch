@@ -87,6 +87,20 @@ check "проблема про подключение" jq -e '[.problems[] | sel
 D=$(blockwatch doctor 2>&1)
 check "doctor: таблица из constants.sh" sh -c "echo \"\$0\" | grep -q 'NetShiftTable / netshift_subnets'" "$D"
 check "doctor: socks-вход service-mixed-in" sh -c "echo \"\$0\" | grep -q '127.0.0.1:4534'" "$D"
+# без socks-входа (Zapret-Manager выключает загрузку списков через прокси) —
+# туннель через интерфейс секции типа vpn
+jq '.inbounds |= map(select(.type != "mixed"))' /etc/sing-box/config.json > /tmp/nosocks.json
+uci set netshift.main.connection_type=vpn; uci set netshift.main.interface=lo
+T=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; SB_CONFIG=/tmp/nosocks.json; detect_socks && echo "$SOCKS $TUN_OPT $TUN_VAL"')
+check "нет socks — туннель через интерфейс vpn-секции" test "$T" = "if:lo --interface lo"
+uci set netshift.main.interface=nosuchif0
+T=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; SB_CONFIG=/tmp/nosocks.json; detect_socks && echo found || echo none')
+check "интерфейса нет — туннеля нет" test "$T" = none
+uci set blockwatch.main.tunnel_interface=lo
+T=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; SB_CONFIG=/tmp/nosocks.json; detect_socks && echo "$SOCKS"')
+check "tunnel_interface задан вручную" test "$T" = "if:lo"
+uci -q delete blockwatch.main.tunnel_interface; uci set netshift.main.connection_type=proxy; uci -q delete netshift.main.interface
+rm -f /tmp/nosocks.json
 
 echo "== стоп-список"
 N=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; build_never; echo "$NEVER"')
@@ -151,7 +165,7 @@ check "стоп-список: .ru не проверяется" sh -c "! grep -qx
 rm -f /tmp/bw-probed
 # признак «установилось и замерло» — решает адрес: сайт целиком резолвится на
 # соседний рабочий узел CDN и дал бы «живой»
-P='. /usr/bin/blockwatch >/dev/null 2>&1
+P='. /usr/bin/blockwatch >/dev/null 2>&1; TUN_OPT=-x; TUN_VAL=socks5://127.0.0.1:4534
 get() { case "$*" in *socks5*) echo 200 ;; *--resolve*) echo "200~" ;; *) echo 200 ;; esac; }'
 R=$(sh -c "$P; probe 138.199.46.65 cdn.example обрыв+молчит")
 check "обрыв: сайт не спасает, решает адрес" test "$R" = "- 200~ 200"
