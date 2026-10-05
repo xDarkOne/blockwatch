@@ -50,6 +50,11 @@ config blockwatch 'main'
 	list never_suffix 'googlevideo.com'
 	list never_suffix 'gvt1.com'
 
+	# 1 — если списки, подключённые командой hook, пропали из настроек netshift/
+	# podkop (Zapret-Manager удаляет их при каждом сохранении секции Forkozz),
+	# вернуть их и один раз перезапустить бэкенд; не чаще раза в 30 минут
+	option auto_rehook '1'
+
 	# Ручная настройка — только если автоопределение не справилось
 	# (посмотреть, что определилось: blockwatch doctor)
 	#option socks '127.0.0.1:4534'

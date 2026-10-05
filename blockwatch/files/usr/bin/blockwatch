@@ -62,6 +62,8 @@ DOMAINS_FILE=$(cfg domains_file /etc/blockwatch/domains.txt)
 # тот сайт). Файл подключается в netshift/podkop как Local Subnet List.
 SUBNETS_FILE=$(cfg subnets_file /etc/blockwatch/subnets.txt)
 SUBNETS_META=/etc/blockwatch/subnets.meta   # «адрес|когда добавлен|имена»
+HOOK_MARK=/etc/blockwatch/hooked             # секция, к которой списки подключены командой hook
+AUTO_REHOOK=$(cfg auto_rehook 1)
 MAX_SUBNETS=$(cfg max_subnets 200)
 # Адрес из списка не перепроверить напрямую — трафик к нему уже в туннеле,
 # и с самого роутера тоже. Поэтому у адресов срок жизни: потом адрес
@@ -571,6 +573,7 @@ scan() {
     [ -s "$DIR/verdicts" ] || { [ -s "$STATE" ] && cp -f "$STATE" "$DIR/verdicts"; }
     forget_stale_verdicts
     expire_ips
+    heal_hook
 
     if [ -z "$BACKEND" ]; then
         logger -t blockwatch "не найден netshift/podkop — заход пропущен"
@@ -1242,6 +1245,58 @@ healthy() {
     [ "${_n:-0}" -gt 0 ]
 }
 
+# Самовосстановление подключения. Zapret-Manager (его netshift — «Forkozz»)
+# при каждом сохранении секции удаляет local_domain_lists/local_subnet_lists,
+# а пути к файлам переносит в «списки по ссылке» (remote_*_lists и zm_refs) —
+# их его netshift качает wget, и локальный файл так не скачивается: списки
+# молча выпадают из туннеля. При переустановке он переписывает настройки
+# целиком. Поэтому, раз списки подключали командой hook (метка $HOOK_MARK),
+# blockwatch возвращает их на место, вычищает свои пути из списков Forkozz и
+# один раз перезапускает бэкенд. То же — если в настройках списки есть, а
+# sing-box собран без них (наложившиеся перезапуски), но лишь когда конфиг
+# собран давно, чтобы не мешать идущему перезапуску. Не чаще раза в 30 минут.
+heal_hook() {
+    [ "$AUTO_REHOOK" = 1 ] && [ -n "$BACKEND" ] || return 0
+    # подключали до появления метки — ставим её по тому, что подключено сейчас
+    if [ ! -s "$HOOK_MARK" ]; then
+        _hs=$(hooked_section); [ -n "$_hs" ] || return 0
+        mkdir -p "$STATE_DIR"; echo "$_hs" > "$HOOK_MARK"
+    fi
+    _hs=$(cat "$HOOK_MARK")
+    uci -q get "$BACKEND.$_hs" >/dev/null || return 0
+    _fix=""
+    for _pair in "local_domain_lists:$DOMAINS_FILE" "local_subnet_lists:$SUBNETS_FILE"; do
+        _opt=${_pair%%:*}; _file=${_pair#*:}
+        uci -q get "$BACKEND.$_hs.$_opt" | tr ' ' '\n' | grep -qxF "$_file" && continue
+        touch "$_file"; uci add_list "$BACKEND.$_hs.$_opt=$_file"; _fix="$_fix $_opt"
+    done
+    for _opt in remote_domain_lists remote_subnet_lists zm_refs; do
+        for _v in $(uci -q get "$BACKEND.$_hs.$_opt"); do
+            case "$_v" in
+                "$DOMAINS_FILE"|"$SUBNETS_FILE"|?:"$DOMAINS_FILE"|?:"$SUBNETS_FILE")
+                    uci del_list "$BACKEND.$_hs.$_opt=$_v"; _fix="$_fix -$_opt" ;;
+            esac
+        done
+    done
+    if [ -z "$_fix" ]; then
+        # в настройках всё есть — а в собранном sing-box?
+        if live_ruleset >/dev/null && ! ruleset_wired; then
+            _age=$(( $(date +%s) - $(date -r "$SB_CONFIG" +%s 2>/dev/null || echo 0) ))
+            [ "$_age" -gt 300 ] && _fix=" не собрано в sing-box"
+        fi
+        [ -n "$_fix" ] || return 0
+    fi
+    uci commit "$BACKEND"
+    _last=$(date -r "$DIR/rehook.at" +%s 2>/dev/null || echo 0)
+    if [ $(( $(date +%s) - _last )) -lt 1800 ]; then
+        logger -t blockwatch "списки возвращены в $BACKEND.$_hs, перезапуск отложен (был меньше 30 мин назад)"
+        return 0
+    fi
+    touch "$DIR/rehook.at"
+    log_find "ВОССТАНОВЛЕНО подключение к $BACKEND.$_hs:$_fix — перезапускаю $BACKEND"
+    ( trap "" HUP; /usr/bin/blockwatch apply-bg >/dev/null 2>&1 & ) </dev/null
+}
+
 apply_bg() {
     jq -n --arg t "$(date '+%H:%M')" --arg b "$BACKEND" \
         '{state: "restart", at: $t, message: "\($b) перезапускается"}' > "$DIR/apply.json"
@@ -1493,11 +1548,13 @@ hook() {   # секция
     [ -n "$_cur" ] || uci add_list "$BACKEND.$_sec.local_domain_lists=$DOMAINS_FILE"
     subnets_hooked || uci add_list "$BACKEND.$_sec.local_subnet_lists=$SUBNETS_FILE"
     uci commit "$BACKEND"
+    mkdir -p "$STATE_DIR"; echo "$_sec" > "$HOOK_MARK"
     echo "подключён к $BACKEND.$_sec; $BACKEND перезапускается один раз, чтобы собрать списки"
     ( trap "" HUP; /usr/bin/blockwatch apply-bg >/dev/null 2>&1 & ) </dev/null
 }
 
 unhook() {
+    rm -f "$HOOK_MARK"   # отключили сами — возвращать не будем
     [ -n "$BACKEND" ] || return 0
     for _sec in $(uci show "$BACKEND" 2>/dev/null | grep -F "$DOMAINS_FILE" |
                   sed -n "s/^$BACKEND\.\([A-Za-z0-9_]*\)\.local_domain_lists=.*/\1/p"); do

@@ -530,6 +530,46 @@ blockwatch unhook >/dev/null 2>&1
 check "unhook убрал путь" sh -c "! uci -q get netshift.main.local_domain_lists"
 check "unhook убрал и список адресов" sh -c "! uci -q get netshift.main.local_subnet_lists"
 
+echo "== самовосстановление подключения (Forkozz удаляет local-списки)"
+blockwatch hook main >/dev/null 2>&1
+check "hook ставит метку" grep -qx main /etc/blockwatch/hooked
+# как сохраняет Forkozz: local-списки удалены, пути — в remote-списках и zm_refs
+uci -q delete netshift.main.local_domain_lists; uci -q delete netshift.main.local_subnet_lists
+uci add_list netshift.main.remote_domain_lists=/etc/blockwatch/domains.txt
+uci add_list netshift.main.remote_domain_lists=https://example.com/list.txt
+uci add_list netshift.main.remote_subnet_lists=/etc/blockwatch/subnets.txt
+uci add_list netshift.main.zm_refs=l:/etc/blockwatch/domains.txt
+uci add_list netshift.main.zm_refs=s:https://example.com/list.txt
+uci commit netshift
+rm -f /tmp/blockwatch/rehook.at
+H='. /usr/bin/blockwatch >/dev/null 2>&1; apply_bg() { :; }'
+sh -c "$H; heal_hook"
+check "вернул список доменов" sh -c "uci -q get netshift.main.local_domain_lists | grep -q /etc/blockwatch/domains.txt"
+check "вернул список адресов" sh -c "uci -q get netshift.main.local_subnet_lists | grep -q /etc/blockwatch/subnets.txt"
+check "убрал свои пути из remote-списков" sh -c "! uci -q get netshift.main.remote_domain_lists | grep -q blockwatch && ! uci -q get netshift.main.remote_subnet_lists | grep -q blockwatch"
+check "чужое в remote-списках не тронул" sh -c "uci -q get netshift.main.remote_domain_lists | grep -q example.com/list.txt && uci -q get netshift.main.zm_refs | grep -q 's:https://example.com'"
+check "убрал свои пути из zm_refs" sh -c "! uci -q get netshift.main.zm_refs | grep -q blockwatch"
+check "записал в журнал и отметил перезапуск" sh -c "grep -q 'ВОССТАНОВЛЕНО подключение к netshift.main' /etc/blockwatch/blockwatch.log && test -f /tmp/blockwatch/rehook.at"
+uci -q delete netshift.main.local_domain_lists; uci commit netshift
+L1=$(grep -c ВОССТАНОВЛЕНО /etc/blockwatch/blockwatch.log)
+sh -c "$H; heal_hook"
+check "через минуту снова удалили — вернул, но без перезапуска" sh -c "uci -q get netshift.main.local_domain_lists | grep -q blockwatch && test $(grep -c ВОССТАНОВЛЕНО /etc/blockwatch/blockwatch.log) = $L1"
+uci -q delete netshift.main.local_domain_lists; uci commit netshift
+sh -c "$H; AUTO_REHOOK=0; heal_hook"
+check "auto_rehook=0 — не трогает" sh -c "! uci -q get netshift.main.local_domain_lists"
+blockwatch unhook >/dev/null 2>&1
+check "unhook снимает метку" test ! -f /etc/blockwatch/hooked
+sh -c "$H; heal_hook"
+check "после unhook не возвращает" sh -c "! uci -q get netshift.main.local_subnet_lists"
+# подключали до метки: метка ставится по тому, что подключено сейчас
+uci add_list netshift.main.local_domain_lists=/etc/blockwatch/domains.txt; uci commit netshift
+sh -c "$H; heal_hook"
+check "перенос: метка по текущему подключению" grep -qx main /etc/blockwatch/hooked
+uci -q delete netshift.main.local_domain_lists; uci -q delete netshift.main.local_subnet_lists
+uci -q delete netshift.main.remote_domain_lists; uci -q delete netshift.main.remote_subnet_lists; uci -q delete netshift.main.zm_refs
+uci commit netshift; rm -f /etc/blockwatch/hooked /tmp/blockwatch/rehook.at
+
+
 echo "== podkop"
 fake_backend podkop PodkopTable podkop_subnets
 blockwatch status > /tmp/s.json 2>/dev/null

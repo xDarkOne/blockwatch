@@ -313,6 +313,12 @@ function settingsMap() {
 	o.default = '1'; o.rmempty = false;
 	o = s.taboption('find', form.Flag, 'auto_export', 'Добавлять подтверждённые сами');
 	o.default = '1'; o.rmempty = false;
+	o = s.taboption('find', form.Flag, 'auto_rehook', 'Возвращать отключённые списки',
+		'Если списки blockwatch пропали из настроек NetShift (Zapret-Manager удаляет их при каждом сохранении ' +
+		'секции Forkozz), вернуть их и один раз перезапустить NetShift — соединения прервутся секунд на двадцать. ' +
+		'Не чаще раза в 30 минут.');
+	o.default = '1'; o.rmempty = false;
+
 	o = s.taboption('find', form.Value, 'confirm_minutes', 'Второе подтверждение через, минут',
 		'Находка добавляется после двух совпадений в разных проверках — так отсекается разовый сбой. ' +
 		'Если сайт снова открывали, вторая проверка идёт через минуту.');
