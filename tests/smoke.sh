@@ -550,7 +550,7 @@ uci add_list netshift.main.zm_refs=l:/etc/blockwatch/domains.txt
 uci add_list netshift.main.zm_refs=s:https://example.com/list.txt
 uci commit netshift
 rm -f /tmp/blockwatch/rehook.times
-H='. /usr/bin/blockwatch >/dev/null 2>&1; apply_bg() { :; }'
+H='. /usr/bin/blockwatch >/dev/null 2>&1; apply_bg() { :; }; AUTO_REHOOK=1'
 sh -c "$H; heal_hook"
 check "вернул список доменов" sh -c "uci -q get netshift.main.local_domain_lists | grep -q /etc/blockwatch/domains.txt"
 check "вернул список адресов" sh -c "uci -q get netshift.main.local_subnet_lists | grep -q /etc/blockwatch/subnets.txt"
@@ -586,6 +586,45 @@ check "перенос: метка по текущему подключению" 
 uci -q delete netshift.main.local_domain_lists; uci -q delete netshift.main.local_subnet_lists
 uci -q delete netshift.main.remote_domain_lists; uci -q delete netshift.main.remote_subnet_lists; uci -q delete netshift.main.zm_refs
 uci commit netshift; rm -f /etc/blockwatch/hooked /tmp/blockwatch/rehook.times
+
+echo "== Zapret-Manager: списки по ссылке"
+mkdir -p /opt/zapret-manager-luci && touch /opt/zapret-manager-luci/netshift.uc
+uci add_list netshift.main.zm_refs=s:https://example.com/list.txt
+uci add_list netshift.main.remote_domain_lists=https://example.com/list.txt
+uci commit netshift
+blockwatch hook main >/dev/null 2>&1
+U=http://127.0.0.1/blockwatch
+check "ссылки в доменных внешних списках" sh -c "uci -q get netshift.main.remote_domain_lists | grep -q '$U/domains.txt' && uci -q get netshift.main.remote_domain_lists | grep -q '$U/subnets.txt'"
+check "ссылки в подсетевых внешних списках" sh -c "uci -q get netshift.main.remote_subnet_lists | grep -q '$U/subnets.txt'"
+check "ссылки и в zm_refs" sh -c "uci -q get netshift.main.zm_refs | grep -q 'l:$U/domains.txt'"
+check "чужое не тронуто" sh -c "uci -q get netshift.main.zm_refs | grep -q 's:https://example.com/list.txt'"
+check "local-списков нет" sh -c "! uci -q get netshift.main.local_domain_lists"
+check "файлы опубликованы" sh -c "test \$(readlink /www/blockwatch/domains.txt) = /etc/blockwatch/domains.txt && test -L /www/blockwatch/subnets.txt"
+check "подключение видно" sh -c "blockwatch status | jq -e '.hooked == true'"
+blockwatch hook main >/dev/null 2>&1
+check "повторный hook не дублирует" test "$(uci -q get netshift.main.remote_domain_lists | tr ' ' '\n' | grep -c "$U/domains.txt")" = 1
+# живой набор без нового домена — досинхронизация дописывает
+mkdir -p /tmp/sing-box/rulesets
+echo '{"version":3,"rules":[{"domain_suffix":["old.example"]}]}' > /tmp/sing-box/rulesets/main-remote-domains-ruleset.json
+cp /etc/sing-box/config.json /tmp/cfg.bak
+jq '.route.rule_set += [{"tag":"main-remote-domains-ruleset","type":"local","format":"source","path":"/tmp/sing-box/rulesets/main-remote-domains-ruleset.json"}]
+    | .dns.rules += [{"rule_set":["main-remote-domains-ruleset"],"server":"fakeip"}]' /tmp/cfg.bak > /etc/sing-box/config.json
+echo "fresh.example" >> /etc/blockwatch/domains.txt
+sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; sync_live'
+check "досинхронизация дописала домен" jq -e '.rules[0].domain_suffix | index("fresh.example") and index("old.example")' /tmp/sing-box/rulesets/main-remote-domains-ruleset.json
+_m=$(md5sum < /tmp/sing-box/rulesets/main-remote-domains-ruleset.json)
+sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; sync_live'
+check "без нехватки — не переписывает" test "$_m" = "$(md5sum < /tmp/sing-box/rulesets/main-remote-domains-ruleset.json)"
+uci -q delete netshift.main.local_domain_lists; uci commit netshift
+sh -c "$H; heal_hook"
+check "самовосстановление молчит" sh -c "! uci -q get netshift.main.local_domain_lists"
+blockwatch unhook >/dev/null 2>&1
+check "unhook убрал ссылки" sh -c "! uci show netshift | grep -q 127.0.0.1/blockwatch"
+check "unhook оставил чужое" sh -c "uci -q get netshift.main.zm_refs | grep -q example.com/list.txt"
+cp /tmp/cfg.bak /etc/sing-box/config.json; rm -rf /opt/zapret-manager-luci /tmp/sing-box/rulesets/main-remote-*
+sed -i '/fresh.example/d' /etc/blockwatch/domains.txt
+uci -q delete netshift.main.remote_domain_lists; uci -q delete netshift.main.remote_subnet_lists; uci -q delete netshift.main.zm_refs
+uci commit netshift; rm -f /etc/blockwatch/hooked
 
 
 echo "== podkop"

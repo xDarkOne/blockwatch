@@ -63,7 +63,16 @@ DOMAINS_FILE=$(cfg domains_file /etc/blockwatch/domains.txt)
 SUBNETS_FILE=$(cfg subnets_file /etc/blockwatch/subnets.txt)
 SUBNETS_META=/etc/blockwatch/subnets.meta   # «адрес|когда добавлен|имена»
 HOOK_MARK=/etc/blockwatch/hooked             # секция, к которой списки подключены командой hook
-AUTO_REHOOK=$(cfg auto_rehook 1)
+AUTO_REHOOK=$(cfg auto_rehook 0)
+# Как списки подключаются к бэкенду:
+#   local  — Local Domain/Subnet List (обычный netshift и podkop);
+#   remote — «внешние списки по ссылке», которые blockwatch отдаёт с самого
+#            роутера (http://127.0.0.1/blockwatch/…). Так — для Zapret-Manager
+#            (его netshift — «Forkozz»): local-списки он удаляет при каждом
+#            сохранении секции, а свои внешние списки сохраняет.
+PUB_DIR=/www/blockwatch
+PUB_URL_D=http://127.0.0.1/blockwatch/domains.txt
+PUB_URL_S=http://127.0.0.1/blockwatch/subnets.txt
 MAX_SUBNETS=$(cfg max_subnets 200)
 # Адрес из списка не перепроверить напрямую — трафик к нему уже в туннеле,
 # и с самого роутера тоже. Поэтому у адресов срок жизни: потом адрес
@@ -133,6 +142,16 @@ const() {   # имя, значение по умолчанию
 }
 
 detect_backend
+
+case "$(cfg hook_mode auto)" in
+    local)  LIST_KIND=local ;;
+    remote) LIST_KIND=remote ;;
+    *)      if [ "$BACKEND" = netshift ] && [ -f /opt/zapret-manager-luci/netshift.uc ]; then
+                LIST_KIND=remote
+            else
+                LIST_KIND=local
+            fi ;;
+esac
 
 # --- адреса и имена -----------------------------------------------------------
 dns_a() {   # имя [сервер] -> последний IPv4 из ответа
@@ -580,7 +599,9 @@ scan() {
     [ -s "$DIR/verdicts" ] || { [ -s "$STATE" ] && cp -f "$STATE" "$DIR/verdicts"; }
     forget_stale_verdicts
     expire_ips
+    [ "$LIST_KIND" = remote ] && publish_lists
     heal_hook
+    sync_live
 
     if [ -z "$BACKEND" ]; then
         logger -t blockwatch "не найден netshift/podkop — заход пропущен"
@@ -1045,19 +1066,24 @@ ip_ok() {   # адрес — можно ли его добавлять
 }
 
 subnets_hooked() {
-    [ -n "$BACKEND" ] && uci show "$BACKEND" 2>/dev/null | grep -F "$SUBNETS_FILE" | grep -q 'local_subnet_lists='
+    [ -n "$BACKEND" ] || return 1
+    if [ "$LIST_KIND" = remote ]; then
+        uci show "$BACKEND" 2>/dev/null | grep -F "$PUB_URL_S" | grep -q 'remote_subnet_lists='
+    else
+        uci show "$BACKEND" 2>/dev/null | grep -F "$SUBNETS_FILE" | grep -q 'local_subnet_lists='
+    fi
 }
 
 live_subnet_ruleset() {
     _s=$(hooked_section); [ -n "$_s" ] || return 1
-    _f="$RULESET_DIR/$_s-local-subnets-ruleset.json"
+    _f="$RULESET_DIR/$_s-$LIST_KIND-subnets-ruleset.json"
     [ -f "$_f" ] || return 1
     echo "$_f"
 }
 
 subnets_wired() {
     _s=$(hooked_section); [ -n "$_s" ] || return 1
-    jq -e --arg t "$_s-local-subnets-ruleset" '[.route.rule_set[]?.tag] | index($t) != null' \
+    jq -e --arg t "$_s-$LIST_KIND-subnets-ruleset" '[.route.rule_set[]?.tag] | index($t) != null' \
         "$SB_CONFIG" >/dev/null 2>&1
 }
 
@@ -1131,14 +1157,71 @@ export_ips() {   # [auto] — в том же духе, что export_domains
     jq -n --arg t "$(date '+%H:%M')" --arg m "$_m" '{state: "live", at: $t, message: $m}' > "$DIR/apply.json"
 }
 
+# Файлы для «внешних списков по ссылке»: веб-сервер роутера отдаёт их через
+# символьные ссылки — на флеш ничего лишнего не пишется. Видны только из
+# домашней сети: снаружи веб-сервер роутера закрыт.
+publish_lists() {
+    mkdir -p "$PUB_DIR" 2>/dev/null || return 0
+    touch "$DOMAINS_FILE" "$SUBNETS_FILE" 2>/dev/null
+    [ "$(readlink "$PUB_DIR/domains.txt")" = "$DOMAINS_FILE" ] || ln -sf "$DOMAINS_FILE" "$PUB_DIR/domains.txt"
+    [ "$(readlink "$PUB_DIR/subnets.txt")" = "$SUBNETS_FILE" ] || ln -sf "$SUBNETS_FILE" "$PUB_DIR/subnets.txt"
+}
+
+# Досинхронизация живых наборов со своими файлами. Бэкенд пересобирает наборы
+# при перезапуске и обновлении списков, а внешний список по ссылке может и не
+# скачаться (например, при «скачивать списки через VPN» адрес 127.0.0.1 уходит
+# в туннель). Чего из наших файлов в живом наборе нет — дописываем; набор
+# перезаписывается только тогда, когда чего-то не хватает.
+sync_live() {
+    if _f=$(live_ruleset) && ruleset_wired; then
+        jq -r '.rules[]?.domain_suffix[]?' "$_f" 2>/dev/null | tr 'A-Z' 'a-z' | sort -u > "$DIR/sync.have"
+        grep -vE '^[[:space:]]*(#|$)' "$DOMAINS_FILE" 2>/dev/null | awk '{ print tolower($1) }' | sort -u |
+            grep -vxFf "$DIR/sync.have" > "$DIR/sync.miss"
+        if [ -s "$DIR/sync.miss" ]; then
+            _arr=$(jq -R -s 'split("\n") | map(select(length > 0))' < "$DIR/sync.miss")
+            if jq --argjson add "$_arr" '
+                   if ((.rules // []) | length) == 0 then .rules = [{ domain_suffix: $add }]
+                   else .rules[0].domain_suffix = (((.rules[0].domain_suffix // []) + $add) | unique) end
+               ' "$_f" > "$_f.bw-new" 2>/dev/null && jq -e . "$_f.bw-new" >/dev/null 2>&1; then
+                mv "$_f.bw-new" "$_f"
+            else
+                rm -f "$_f.bw-new"
+            fi
+        fi
+    fi
+    if _sf=$(live_subnet_ruleset) && subnets_wired; then
+        _miss=""
+        for _a in $(grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$SUBNETS_FILE" 2>/dev/null); do
+            jq -e --arg a "$_a" '[.rules[]?.ip_cidr[]?] | index($a) != null' "$_sf" >/dev/null 2>&1 ||
+                _miss="$_miss $_a"
+            in_backend_set "$_a" || nft add element inet "$NFT_TABLE" "$NFT_SET" "{ $_a }" 2>/dev/null
+        done
+        if [ -n "$_miss" ]; then
+            _arr=$(echo "$_miss" | tr ' ' '\n' | jq -R -s 'split("\n") | map(select(length > 0))')
+            if jq --argjson add "$_arr" '
+                   if ((.rules // []) | length) == 0 then .rules = [{ ip_cidr: $add }]
+                   else .rules[0].ip_cidr = (((.rules[0].ip_cidr // []) + $add) | unique) end
+               ' "$_sf" > "$_sf.bw-new" 2>/dev/null && jq -e . "$_sf.bw-new" >/dev/null 2>&1; then
+                mv "$_sf.bw-new" "$_sf"
+            else
+                rm -f "$_sf.bw-new"
+            fi
+        fi
+    fi
+    rm -f "$DIR/sync.have" "$DIR/sync.miss"
+}
+
 hooked_section() {
     [ -n "$BACKEND" ] || return 0
     # статус спрашивает это десятки раз — там секция считается один раз
     [ -n "$HS_CACHE" ] && { echo "$HS_CACHE"; return; }
-    uci show "$BACKEND" 2>/dev/null |
-        grep -F "$DOMAINS_FILE" |
-        sed -n "s/^$BACKEND\.\([A-Za-z0-9_]*\)\.local_domain_lists=.*/\1/p" |
-        head -1
+    if [ "$LIST_KIND" = remote ]; then
+        uci show "$BACKEND" 2>/dev/null | grep -F "$PUB_URL_D" |
+            sed -n "s/^$BACKEND\.\([A-Za-z0-9_]*\)\.remote_domain_lists=.*/\1/p" | head -1
+    else
+        uci show "$BACKEND" 2>/dev/null | grep -F "$DOMAINS_FILE" |
+            sed -n "s/^$BACKEND\.\([A-Za-z0-9_]*\)\.local_domain_lists=.*/\1/p" | head -1
+    fi
 }
 
 hooked_up() { [ -n "$(hooked_section)" ]; }
@@ -1146,7 +1229,7 @@ hooked_up() { [ -n "$(hooked_section)" ]; }
 # Набор, который бэкенд собрал из нашего файла. sing-box перечитывает его сам.
 live_ruleset() {
     _s=$(hooked_section); [ -n "$_s" ] || return 1
-    _f="$RULESET_DIR/$_s-local-domains-ruleset.json"
+    _f="$RULESET_DIR/$_s-$LIST_KIND-domains-ruleset.json"
     [ -f "$_f" ] || return 1
     echo "$_f"
 }
@@ -1159,7 +1242,7 @@ live_ruleset() {
 # их не видит. Так было 29.09.2026 на домашнем роутере.
 ruleset_wired() {
     _s=$(hooked_section); [ -n "$_s" ] || return 1
-    jq -e --arg t "$_s-local-domains-ruleset" '
+    jq -e --arg t "$_s-$LIST_KIND-domains-ruleset" '
         ([.route.rule_set[]?.tag] | index($t) != null) and
         ([.dns.rules[]? | .rule_set? // empty | if type == "array" then .[] else . end]
             | index($t) != null)' "$SB_CONFIG" >/dev/null 2>&1
@@ -1263,7 +1346,8 @@ healthy() {
 # sing-box собран без них (наложившиеся перезапуски), но лишь когда конфиг
 # собран давно, чтобы не мешать идущему перезапуску. Не чаще раза в 30 минут.
 heal_hook() {
-    [ "$AUTO_REHOOK" = 1 ] && [ -n "$BACKEND" ] || return 0
+    # внешние списки по ссылке Zapret-Manager сохраняет сам — чинить нечего
+    [ "$AUTO_REHOOK" = 1 ] && [ -n "$BACKEND" ] && [ "$LIST_KIND" = local ] || return 0
     # подключали до появления метки — ставим её по тому, что подключено сейчас
     if [ ! -s "$HOOK_MARK" ]; then
         _hs=$(hooked_section); [ -n "$_hs" ] || return 0
@@ -1346,7 +1430,11 @@ problems() {   # по строке на проблему
     fi
     hooked_up || echo "файл $DOMAINS_FILE не подключён к $BACKEND: blockwatch hook <секция>"
     if hooked_up && ! live_ruleset >/dev/null; then
-        echo "файл подключён, но $BACKEND ещё не собрал из него список — перезапусти $BACKEND один раз"
+        if [ "$LIST_KIND" = remote ]; then
+            echo "списки подключены по ссылке, но $BACKEND ещё не скачал их — обнови списки в $BACKEND или перезапусти его; если ссылка $PUB_URL_D не открывается с роутера, проверь веб-сервер (uhttpd)"
+        else
+            echo "файл подключён, но $BACKEND ещё не собрал из него список — перезапусти $BACKEND один раз"
+        fi
     fi
     [ "$(domains_count)" -ge "$MAX_TOTAL" ] &&
         echo "список доменов достиг предела $MAX_TOTAL — новые не добавляются: почисти $DOMAINS_FILE или подними blockwatch.main.max_domains"
@@ -1559,8 +1647,27 @@ hook() {   # секция
     # список адресов подключается в ту же секцию, что и список доменов
     [ -n "$_cur" ] && _sec=$_cur
     touch "$DOMAINS_FILE" "$SUBNETS_FILE"
-    [ -n "$_cur" ] || uci add_list "$BACKEND.$_sec.local_domain_lists=$DOMAINS_FILE"
-    subnets_hooked || uci add_list "$BACKEND.$_sec.local_subnet_lists=$SUBNETS_FILE"
+    if [ "$LIST_KIND" = remote ]; then
+        publish_lists
+        # убрать прежнее подключение local-списками, если было
+        uci -q del_list "$BACKEND.$_sec.local_domain_lists=$DOMAINS_FILE"
+        uci -q del_list "$BACKEND.$_sec.local_subnet_lists=$SUBNETS_FILE"
+        # как пишет сам Forkozz: оба адреса — и в доменные, и в подсетевые
+        # внешние списки, а если у секции есть zm_refs — ещё и туда, иначе он
+        # при следующем сохранении соберёт списки только из zm_refs
+        _refs=$(uci -q get "$BACKEND.$_sec.zm_refs")
+        for _u in "$PUB_URL_D" "$PUB_URL_S"; do
+            for _opt in remote_domain_lists remote_subnet_lists; do
+                uci -q get "$BACKEND.$_sec.$_opt" | tr ' ' '\n' | grep -qxF "$_u" ||
+                    uci add_list "$BACKEND.$_sec.$_opt=$_u"
+            done
+            [ -n "$_refs" ] && ! echo "$_refs" | tr ' ' '\n' | grep -qxF "l:$_u" &&
+                uci add_list "$BACKEND.$_sec.zm_refs=l:$_u"
+        done
+    else
+        [ -n "$_cur" ] || uci add_list "$BACKEND.$_sec.local_domain_lists=$DOMAINS_FILE"
+        subnets_hooked || uci add_list "$BACKEND.$_sec.local_subnet_lists=$SUBNETS_FILE"
+    fi
     uci commit "$BACKEND"
     mkdir -p "$STATE_DIR"; echo "$_sec" > "$HOOK_MARK"
     echo "подключён к $BACKEND.$_sec; $BACKEND перезапускается один раз, чтобы собрать списки"
@@ -1578,6 +1685,16 @@ unhook() {
     for _sec in $(uci show "$BACKEND" 2>/dev/null | grep -F "$SUBNETS_FILE" |
                   sed -n "s/^$BACKEND\.\([A-Za-z0-9_]*\)\.local_subnet_lists=.*/\1/p"); do
         uci del_list "$BACKEND.$_sec.local_subnet_lists=$SUBNETS_FILE"
+    done
+    # внешние списки по ссылке (Zapret-Manager)
+    for _sec in $(uci show "$BACKEND" 2>/dev/null | grep -F "$PUB_URL_D" |
+                  sed -n "s/^$BACKEND\.\([A-Za-z0-9_]*\)\.[a-z_]*=.*/\1/p" | sort -u); do
+        for _u in "$PUB_URL_D" "$PUB_URL_S"; do
+            uci -q del_list "$BACKEND.$_sec.remote_domain_lists=$_u"
+            uci -q del_list "$BACKEND.$_sec.remote_subnet_lists=$_u"
+            uci -q del_list "$BACKEND.$_sec.zm_refs=l:$_u"
+        done
+        echo "отключён от $BACKEND.$_sec (подействует после перезапуска $BACKEND)"
     done
     uci commit "$BACKEND"
 }

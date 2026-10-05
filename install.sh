@@ -106,6 +106,7 @@ remove_files() {
         rm -f "$_dst"
     done
     rmdir /www/luci-static/resources/view/blockwatch 2>/dev/null || true
+    rm -rf /www/blockwatch
 }
 
 refresh_luci() {
@@ -145,7 +146,9 @@ case "$1" in
             say "Дальше:"
             say "  1. подключи списки доменов и адресов к netshift/podkop:  blockwatch hook main"
             say "     (или вручную: секция → Local Domain Lists → /etc/blockwatch/domains.txt"
-            say "      и Local Subnet Lists → /etc/blockwatch/subnets.txt)"
+            say "      и Local Subnet Lists → /etc/blockwatch/subnets.txt;"
+            say "      при Zapret-Manager — Forkozz → внешние списки по ссылке:"
+            say "      http://127.0.0.1/blockwatch/domains.txt и subnets.txt)"
             say "  2. смотри, что происходит: LuCI → Службы → Blockwatch"
         fi
         ;;
