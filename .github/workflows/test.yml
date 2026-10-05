@@ -12,7 +12,7 @@ jobs:
   lint:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: shellcheck
         run: |
@@ -42,6 +42,6 @@ jobs:
       matrix:
         openwrt: ["24.10", "25.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: OpenWrt ${{ matrix.openwrt }}
         run: bash tests/run-rootfs.sh ${{ matrix.openwrt }}
