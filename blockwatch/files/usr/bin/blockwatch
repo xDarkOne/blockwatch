@@ -197,10 +197,21 @@ build_never() {
             *[!0-9.]*) _list="$_list $_h $(echo "$_h" | awk -F. 'NF >= 2 { print $(NF-1) "." $NF }')" ;;
         esac
     done
-    NEVER=""
+    # Записи без точки — целые зоны (ru, su, xn--p1ai) — «мягкие»: домен из
+    # них проверяется, если в трафике к нему виден обрыв. Так провайдер режет
+    # зарубежный хостинг (Vercel, Cloudflare), а российский сайт на российском
+    # сервере так не обрывается. 07.10 www.deaddinos.ru на Vercel обрывался
+    # на 10 КБ, а blockwatch его даже не проверял. Выключить: zones_on_cut=0.
+    NEVER=""; NEVER_HARD=""; NEVER_SOFT=""
+    _soft=$(cfg zones_on_cut 1)
     for _s in $_list; do
         _e=$(printf '%s' "$_s" | sed 's/\./\\./g')
-        NEVER="${NEVER:+$NEVER|}(^|\\.)$_e\$"
+        _r="(^|\\.)$_e\$"
+        NEVER="${NEVER:+$NEVER|}$_r"
+        case "$_soft:$_s" in
+            1:*.*|0:*) NEVER_HARD="${NEVER_HARD:+$NEVER_HARD|}$_r" ;;
+            *)         NEVER_SOFT="${NEVER_SOFT:+$NEVER_SOFT|}$_r" ;;
+        esac
     done
     # Для адресов — строже: адрес захватывает все сайты на нём. Адреса Google и
     # YouTube не трогаем: YouTube у многих нарочно идёт через zapret, и завернуть
@@ -925,9 +936,18 @@ check_one() {   # адрес, признак, [имя]
 
     [ -n "$dom" ] || dom=$(domain_of "$ip")
     # российское и прочее из стоп-списка не добавится никогда — и проверять
-    # незачем: на загруженной сети это половина кандидатов (yandex, .ru)
-    [ -n "$dom" ] && [ -n "$NEVER" ] && echo "$dom" | grep -qEi "$NEVER" && return 0
+    # незачем: на загруженной сети это половина кандидатов (yandex, .ru).
+    # Зоны (.ru и т. п.) — только без обрыва и без начатой проверки.
     old=$(verdict_line "$ip" "${dom:--}")
+    if [ -n "$dom" ]; then
+        [ -n "$NEVER_HARD" ] && echo "$dom" | grep -qEi "$NEVER_HARD" && return 0
+        if [ -n "$NEVER_SOFT" ] && echo "$dom" | grep -qEi "$NEVER_SOFT"; then
+            case "$why" in
+                *обрыв*|*замер*) ;;
+                *) [ -n "$old" ] || return 0 ;;
+            esac
+        fi
+    fi
     if [ -n "$old" ]; then
         last=$(echo "$old" | cut -d'|' -f6)
         wait=$RECHECK
@@ -1024,7 +1044,7 @@ pending() {
         BEGIN { while ((getline l < sf) > 0) sh[l] = 1 }
         $3 == "ЗАБЛОКИРОВАН" && $4 + 0 >= 2 && $2 != "-" && now - $6 < 86400 &&
         !($8 ~ /^-\// && ($1 in sh)) { print $2 }' \
-        "$DIR/verdicts" | sort -u | grep -vEi "$NEVER" |
+        "$DIR/verdicts" | sort -u | { if [ -n "$NEVER_HARD" ]; then grep -vEi "$NEVER_HARD"; else cat; fi; } |
         while read -r d; do
             grep -qxiF "$d" "$DOMAINS_FILE" 2>/dev/null && continue
             # уже есть в каком-то списке бэкенда — решение там принято до нас

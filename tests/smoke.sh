@@ -164,13 +164,32 @@ S=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; stalled_flows /tmp/bw-f0 /tmp/
 rm -f /tmp/bw-f0 /tmp/bw-f1 /tmp/bw-f2
 check "не ответили даже на TLS — обрыв" sh -c "echo \"\$0\" | grep -q '216.150.16.65 обрыв'" "$S"
 check "почти ничего не отправили — не в счёт" sh -c "! echo \"\$0\" | grep -q 203.0.113.88" "$S"
-# стоп-список: кандидат с российским именем не проверяется вовсе
+# стоп-список: российское имя без обрыва не проверяется вовсе, с обрывом —
+# проверяется (так режут зарубежный хостинг); конкретные домены — никогда
+NV='. /usr/bin/blockwatch >/dev/null 2>&1; build_never; checked=0; checked_run=0; now=10000
+    probe() { echo "$PROBE" >> /tmp/bw-probed; echo "000~ 000~ 200"; }'
+: > /tmp/bw-probed; : > /tmp/blockwatch/verdicts
+sh -c "$NV; PROBE=rst; check_one 213.180.204.179 сброс push.yandex.ru"
+sh -c "$NV; PROBE=sw; check_one 213.180.204.179 обход push.yandex.ru"
+check "стоп-список: .ru без обрыва не проверяется" test ! -s /tmp/bw-probed
+sh -c "$NV; PROBE=cut; check_one 64.29.17.1 обрыв www.deaddinos.ru"
+check "стоп-список: .ru с обрывом проверяется" grep -qx cut /tmp/bw-probed
+sh -c "$NV; PROBE=zam; check_one 64.29.17.2 замер www.deaddinos.ru"
+check "стоп-список: .ru с замером проверяется" grep -qx zam /tmp/bw-probed
+sh -c "$NV; now=20000; PROBE=again; check_one 64.29.17.1 обход www.deaddinos.ru"
+check "начатая проверка .ru доводится до конца" grep -qx again /tmp/bw-probed
+check "…и .ru подтверждён" grep -q '^64.29.17.1|www.deaddinos.ru|ЗАБЛОКИРОВАН|2|' /tmp/blockwatch/verdicts
+T=$(date +%s); echo "64.29.17.1|www.deaddinos.ru|ЗАБЛОКИРОВАН|2|$T|$T|обрыв|000~/000~/200" > /tmp/blockwatch/verdicts
+P=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; pending')
+check "подтверждённый .ru идёт в список" sh -c "echo \"\$0\" | grep -qx www.deaddinos.ru" "$P"
 : > /tmp/bw-probed
-sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; build_never; checked=0; checked_run=0; now=10000
-    probe() { echo ru >> /tmp/bw-probed; echo "200 - -"; }; domain_of() { echo push.yandex.ru; }
-    check_one 213.180.204.179 замер'
-check "стоп-список: .ru не проверяется" sh -c "! grep -qx ru /tmp/bw-probed"
-rm -f /tmp/bw-probed
+sh -c "$NV; PROBE=gv; check_one 203.0.113.70 обрыв rr1.googlevideo.com"
+check "стоп-список: конкретный домен не проверяется и с обрывом" test ! -s /tmp/bw-probed
+uci set blockwatch.main.zones_on_cut=0; uci commit blockwatch
+sh -c "$NV; PROBE=off; check_one 64.29.17.3 обрыв other.example.ru"
+check "zones_on_cut=0: .ru не проверяется и с обрывом" test ! -s /tmp/bw-probed
+uci -q delete blockwatch.main.zones_on_cut; uci commit blockwatch
+: > /tmp/blockwatch/verdicts; rm -f /tmp/bw-probed
 # признак «установилось и замерло» — решает адрес: сайт целиком резолвится на
 # соседний рабочий узел CDN и дал бы «живой»
 P='. /usr/bin/blockwatch >/dev/null 2>&1; TUN_OPT=-x; TUN_VAL=socks5://127.0.0.1:4534

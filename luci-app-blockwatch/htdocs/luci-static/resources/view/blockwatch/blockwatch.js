@@ -347,6 +347,11 @@ function settingsMap() {
 	o = s.taboption('never', form.DynamicList, 'never_suffix', 'Не добавлять никогда',
 		'Окончания доменов. Имена своих серверов из конфига sing-box добавляются сами.');
 	o.placeholder = 'ru';
+	o = s.taboption('never', form.Flag, 'zones_on_cut', 'Зоны — только пока нет обрыва',
+		'Записи без точки (ru, su, xn--p1ai) — целые зоны. Домен из них всё же проверяется, если соединения к нему ' +
+		'обрываются на середине: так провайдер режет зарубежный хостинг (Vercel, Cloudflare), даже если сайт в зоне .ru. ' +
+		'Добавляется, только если напрямую не открылся, а через туннель — да. Адреса с такими именами не добавляются.');
+	o.default = '1'; o.rmempty = false;
 	o = s.taboption('never', form.DynamicList, 'never_ip_suffix', 'Не добавлять адреса с этими именами',
 		'Вдобавок к списку выше. По умолчанию — Google и YouTube: YouTube у многих нарочно идёт через zapret.');
 	o.placeholder = 'youtube.com';
