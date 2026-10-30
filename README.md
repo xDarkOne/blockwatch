@@ -62,6 +62,8 @@ blockwatch hook main
 
 Смотреть, что происходит: **LuCI → Службы → Blockwatch**.
 
+Ссылки и файлы списков для ручного подключения (например, в Forkozz) показывают вкладка «Обзор» и `blockwatch doctor`: `http://127.0.0.1/blockwatch/domains.txt` и `http://127.0.0.1/blockwatch/subnets.txt`.
+
 ## Что меняется в системе
 
 | что | зачем | при удалении |

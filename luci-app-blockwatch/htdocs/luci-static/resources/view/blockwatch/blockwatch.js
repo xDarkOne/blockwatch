@@ -173,6 +173,23 @@ function problemsBlock(state, st) {
 			[hookButton(state, st)]));
 }
 
+// Пути и ссылки на списки: их можно добавить в netshift/Forkozz вручную
+function listsBlock(st) {
+	if (!st.lists) return '';
+	var row = function (name, url, file) {
+		return E('tr', { 'class': 'tr' }, [cell(name), cell(E('code', {}, url)), cell(E('code', {}, file))]);
+	};
+	return E('div', {}, [
+		E('h4', {}, 'Списки для подключения вручную'),
+		E('p', { 'class': 'bw-muted' }, 'Forkozz / Zapret-Manager: добавь ссылки в «внешние списки по ссылке» (и доменные, и подсетевые). ' +
+			'Обычный netshift/podkop: укажи файлы в Local Domain / Subnet Lists.'),
+		table(['Список', 'Ссылка', 'Файл'], [
+			row('Домены', st.lists.domains_url, st.lists.domains_file),
+			row('Адреса', st.lists.subnets_url, st.lists.subnets_file)
+		], ['15%', '45%', '40%'])
+	]);
+}
+
 // --- вкладки ---------------------------------------------------------------------
 function overviewTab(state, st) {
 	var nodes = [
@@ -180,6 +197,7 @@ function overviewTab(state, st) {
 			st.running ? badge('идёт заход', 'blue') : badge('между заходами')]),
 		st.hooked ? E('p', {}, ['Списки подключены к ' + backendName(st) + ', секция «' + st.section + '»: ',
 			E('code', {}, st.file), st.ips_hooked ? ' и адреса' : '']) : '',
+		listsBlock(st),
 		st.tunnel ? E('p', {}, st.tunnel.ok
 			? 'Туннель для проверки: ' + tunnelLabel(st.tunnel.socks) + ' (выход ' + st.tunnel.tunnel + ', напрямую ' + st.tunnel.direct + ')'
 			: 'Туннель для проверки не найден.') : '',

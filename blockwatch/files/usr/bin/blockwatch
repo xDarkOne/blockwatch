@@ -610,7 +610,7 @@ scan() {
     [ -s "$DIR/verdicts" ] || { [ -s "$STATE" ] && cp -f "$STATE" "$DIR/verdicts"; }
     forget_stale_verdicts
     expire_ips
-    [ "$LIST_KIND" = remote ] && publish_lists
+    publish_lists   # ссылки нужны и для ручного подключения в Forkozz
     heal_hook
     sync_live
 
@@ -1538,7 +1538,7 @@ status_json() {
             '{ok: $ok, direct: $direct, tunnel: $tunnel, socks: $socks, at: $at}')
     fi
     jq -n --arg version "$VERSION" --arg backend "${BACKEND:-}" \
-          --arg file "$DOMAINS_FILE" --arg section "$(hooked_section)" \
+          --arg file "$DOMAINS_FILE" --arg sfile "$SUBNETS_FILE" --arg durl "$PUB_URL_D" --arg surl "$PUB_URL_S" --arg section "$(hooked_section)" \
           --argjson found "$_found" --argjson pending "$_pend" --argjson added "$_added" \
           --argjson checked "${1:-0}" --argjson alive "${2:-0}" --argjson down "${3:-0}" \
           --argjson running "$_run" --argjson apply "$_apply" --argjson tunnel "$_tun" \
@@ -1547,6 +1547,7 @@ status_json() {
           --argjson recheck "{\"auto_remove\": $([ "$AUTO_REMOVE" = 1 ] && echo true || echo false), \"hours\": $((RECHECK_LISTED / 3600)), \"remove_after\": $REMOVE_AFTER}" \
           --argjson problems "$(problems | json_lines)" \
           '{version: $version, backend: $backend, file: $file,
+            lists: {domains_file: $file, subnets_file: $sfile, domains_url: $durl, subnets_url: $surl},
             hooked: ($section != ""), section: $section, wired: $wired,
             checked: $checked, alive: $alive, down: $down, running: $running,
             tunnel: $tunnel, apply: $apply, problems: $problems,
@@ -1743,6 +1744,10 @@ doctor() {
         echo "НЕТ ($_d напрямую, ${_t:--} через туннель)"
     fi
     echo "файл доменов:  $DOMAINS_FILE, секция: $(hooked_section || true)"
+    echo "файл адресов:  $SUBNETS_FILE"
+    echo "ссылки для ручного подключения (Forkozz → внешние списки по ссылке):"
+    echo "  домены:  $PUB_URL_D"
+    echo "  адреса:  $PUB_URL_S"
     echo "живой список:  $(live_ruleset || echo нет)"
     printf "бэкенд здоров: "; healthy && echo да || echo нет
     echo
@@ -1760,7 +1765,7 @@ case "$1" in
     hook)      hook "$2" ;;
     unhook)    unhook ;;
     doctor)    doctor ;;
-    install)   setup_system ;;
+    install)   setup_system; publish_lists ;;
     uninstall)
         restore_system
         # через if, а не через &&: без --purge цепочка `[ ] && …` вернула бы 1,
