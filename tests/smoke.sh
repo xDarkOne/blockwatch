@@ -297,14 +297,14 @@ cat > /tmp/blockwatch/verdicts <<'EOF'
 216.150.1.1|noodledude.io|лежит|0|28000|28000|нет-ответа|000~/000~/000~
 203.0.113.20|dead.example.com|лежит|0|1000|28000|нет-ответа|000~/000~/000~
 203.0.113.21|half.example.com|ЗАБЛОКИРОВАН|1|28000|28000|обрыв|200~/200~/200
-203.0.113.22|fresh.example.com|лежит|0|29900|29900|нет-ответа|000~/000~/000~
+203.0.113.22|fresh.example.com|лежит|0|29970|29970|нет-ответа|000~/000~/000~
 203.0.113.25|edge.cdn.example|лежит|0|28000|28000|обход|000~/000~/000~
 EOF
 R=$(sh -c '. /usr/bin/blockwatch >/dev/null 2>&1; now=30000; redo_list')
 check "«лежит» один раз — в повтор" sh -c "echo \"\$0\" | grep -qx '216.150.1.1 нет-ответа noodledude.io'" "$R"
 check "«лежит» дважды — не в повтор" sh -c "! echo \"\$0\" | grep -q dead.example.com" "$R"
 check "недоподтверждённое — в повтор" sh -c "echo \"\$0\" | grep -q half.example.com" "$R"
-check "моложе 5 минут — не в повтор" sh -c "! echo \"\$0\" | grep -q fresh.example.com" "$R"
+check "моложе confirm_minutes — не в повтор" sh -c "! echo \"\$0\" | grep -q fresh.example.com" "$R"
 check "«лежит» из обхода — не в повтор" sh -c "! echo \"\$0\" | grep -q edge.cdn.example" "$R"
 check "«лежит» старше RECHECK — не в повтор" sh -c "! echo \"\$0\" | grep -q ancient.example.com" "$R"
 check "свежие — первыми" test "$(echo "$R" | grep -E 'noodledude|older' | head -1 | cut -d' ' -f3)" = noodledude.io
@@ -354,7 +354,7 @@ sh -c "$CK; now=1070; PROBE=f5; check_one 203.0.113.61 обрыв pend.example"
 check "повторный заход через минуту — подтверждение" grep -qx f5 /tmp/bw-probed
 echo "203.0.113.61|pend.example|ЗАБЛОКИРОВАН|1|1000|1000|обрыв|200~/200~/200" > /tmp/blockwatch/verdicts
 : > /tmp/bw-probed
-sh -c "$CK; now=1070; PROBE=sw; check_one 203.0.113.61 обход pend.example"
+sh -c "$CK; now=1030; PROBE=sw; check_one 203.0.113.61 обход pend.example"
 check "обход — ждёт confirm_minutes" sh -c "! grep -qx sw /tmp/bw-probed"
 # туннель не ответил на подтверждении — находка не теряется, но только один раз
 echo "203.0.113.50|flaky.example|ЗАБЛОКИРОВАН|1|1000|1000|обрыв|200~/200~/200" > /tmp/blockwatch/verdicts
@@ -449,7 +449,34 @@ D=$(sh -c "$RC; now=100000; RECHECK_LISTED=259200; listed_due")
 check "после неудачи — ждёт полный интервал" sh -c "! echo \"\$0\" | grep -qx keep.example" "$D"
 sh -c "$RC; now=5000; RECHECK_LISTED=259200; get() { echo 200; }; recheck_one keep.example"
 D=$(sh -c "$RC; now=95000; RECHECK_LISTED=259200; listed_due")
-check "после удачи — через сутки" sh -c "echo \"\$0\" | grep -qx keep.example" "$D"
+check "после удачи — через RECHECK_OK" sh -c "echo \"\$0\" | grep -qx keep.example" "$D"
+D=$(sh -c "$RC; now=$((5000 + 20000)); RECHECK_LISTED=259200; listed_due")
+check "после удачи — раньше 6 часов не трогаем" sh -c "! echo \"\$0\" | grep -qx keep.example" "$D"
+D=$(sh -c "$RC; now=$((5000 + 22000)); RECHECK_LISTED=259200; listed_due")
+check "после удачи — ровно через 6 часов" sh -c "echo \"\$0\" | grep -qx keep.example" "$D"
+
+echo "== мост по адресам до истечения кэша DNS у клиентов"
+rm -f /tmp/blockwatch/bridge /tmp/bw-nft
+cp -f /tmp/blockwatch/ipmap /tmp/bw-ipmap.save 2>/dev/null
+printf '203.0.113.7 br.example\n203.0.113.8 br.example\n10.1.1.1 br.example\n203.0.113.9 other.example\n' > /tmp/blockwatch/ipmap
+printf '203.0.113.8\n' > /tmp/bw-subnets-br.txt
+BR='. /usr/bin/blockwatch >/dev/null 2>&1; NFT_TABLE=t; NFT_SET=s; SUBNETS_FILE=/tmp/bw-subnets-br.txt
+nft() { echo "$*" >> /tmp/bw-nft; }
+in_backend_set() { [ "$1" = 203.0.113.99 ]; }'
+sh -c "$BR; now=1000; bridge_add br.example"
+check "мост: адрес домена добавлен в множество" grep -q '203.0.113.7' /tmp/bw-nft
+check "мост: чужой адрес на CDN не тронут" sh -c "! grep -q 203.0.113.9 /tmp/bw-nft"
+check "мост: частный адрес не тронут" sh -c "! grep -q 10.1.1.1 /tmp/bw-nft"
+check "мост: срок записан" grep -q '^203.0.113.7|2800$' /tmp/blockwatch/bridge
+: > /tmp/bw-nft
+sh -c "$BR; now=2000; expire_bridge"
+check "мост: до срока ничего не снимается" test ! -s /tmp/bw-nft
+sh -c "$BR; now=2801; expire_bridge"
+check "мост: по сроку адрес снят" grep -q 'delete element inet t s { 203.0.113.7 }' /tmp/bw-nft
+check "мост: постоянный адрес из subnets.txt не снят" sh -c "! grep -q 'delete.*203.0.113.8' /tmp/bw-nft"
+check "мост: список очищен" test ! -s /tmp/blockwatch/bridge
+rm -f /tmp/blockwatch/bridge /tmp/bw-nft /tmp/bw-subnets-br.txt
+if [ -f /tmp/bw-ipmap.save ]; then mv /tmp/bw-ipmap.save /tmp/blockwatch/ipmap; else rm -f /tmp/blockwatch/ipmap; fi
 sh -c "$RC; now=6000; RECHECK_LISTED=0; AUTO_REMOVE=0; get() { echo 200; }; recheck_one keep.example"
 check "auto_remove=0 — не убирает" grep -qx keep.example /tmp/bw-rd.txt
 rm -rf /tmp/bw-rd.txt /tmp/bw-rs /tmp/bw-listed /tmp/bw-rlog /tmp/blockwatch/verdicts
@@ -467,7 +494,7 @@ check "remove: адрес убран" sh -c "! grep -qx 203.0.113.77 /etc/blockw
 check "remove: чужого нет — ошибка" sh -c "! blockwatch remove nothere.example >/dev/null 2>&1"
 blockwatch status > /tmp/s.json 2>/dev/null
 check "status: адреса, журнал, ожидающие адреса" jq -e '(.ips | type == "array") and (.log | type == "array") and (.pending_ips | type == "array") and (.ips_hooked | type == "boolean")' /tmp/s.json
-check "status: настройки перепроверки" jq -e '.recheck.hours == 72 and .recheck.remove_after == 3 and .recheck.auto_remove == true and (.removed | type == "array")' /tmp/s.json
+check "status: настройки перепроверки" jq -e '.recheck.hours == 24 and .recheck.remove_after == 3 and .recheck.auto_remove == true and (.removed | type == "array")' /tmp/s.json
 
 echo "== адреса: без имени и общие"
 mkdir -p /tmp/blockwatch

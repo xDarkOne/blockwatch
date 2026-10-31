@@ -27,7 +27,7 @@
 #
 # https://github.com/xDarkOne/blockwatch — GPL-2.0
 
-VERSION=0.1.1
+VERSION=0.2.0
 CONFIG=blockwatch
 DIR=/tmp/blockwatch                     # рабочее состояние: ОЗУ, флеш не трогаем
 STATE_DIR=/etc/blockwatch               # на флеш — только находки и настройки
@@ -87,13 +87,15 @@ MAX_DAY=$(cfg max_per_day 30)
 # нельзя — заблокированный сайт молча перестал бы открываться.
 MAX_TOTAL=$(cfg max_domains 500)
 # Перепроверка списка: раз в RECHECK_LISTED домен открывают напрямую; после
-# удачи следующая — через сутки. Убирается после REMOVE_AFTER удач подряд:
+# удачи следующая — через RECHECK_OK. Убирается после REMOVE_AFTER удач подряд:
 # блокировки то включают, то снимают, одной удачи мало.
 AUTO_REMOVE=$(cfg auto_remove 1)
 # Второе подтверждение находки — не раньше чем через столько: два совпадения в
-# разных заходах отсекают разовый сбой, а ждать дольше незачем. Было 15 минут.
-CONFIRM_AFTER=$(($(cfg confirm_minutes 5) * 60))
-RECHECK_LISTED=$(($(cfg recheck_hours 72) * 3600))
+# разных заходах отсекают разовый сбой, а ждать дольше незачем. Было 15 минут,
+# потом 5; клиенту до открытия сайта это добавляло минуты ожидания.
+CONFIRM_AFTER=$(($(cfg confirm_minutes 1) * 60))
+RECHECK_LISTED=$(($(cfg recheck_hours 24) * 3600))
+RECHECK_OK=21600   # после удачной прямой проверки следующая — через столько секунд
 REMOVE_AFTER=$(cfg remove_after 3)
 LOG_KEEP=500       # строк журнала находок
 STATE_EVERY=3600   # как часто сохранять вердикты на флеш, секунд
@@ -573,8 +575,13 @@ probe() {   # адрес, [имя], [признак] -> «сайт адрес т
             *)  _w=$(get 9 "https://$_dom/")
                 ok "$_w" && { echo "$_w - -"; return; } ;;
         esac
-        _d=$(get 7 "https://$_dom/" --resolve "$_dom:443:$_ip")
-        _v=$(get 10 "https://$_dom/" --resolve "$_dom:443:$_ip" "$TUN_OPT" "$TUN_VAL")
+        # адрес напрямую и через туннель — параллельно: ждать ~17 с вместо ~26
+        get 7 "https://$_dom/" --resolve "$_dom:443:$_ip" > "$DIR/p.d.$$" &
+        _pd=$!
+        get 10 "https://$_dom/" --resolve "$_dom:443:$_ip" "$TUN_OPT" "$TUN_VAL" > "$DIR/p.v.$$"
+        wait "$_pd"
+        _d=$(cat "$DIR/p.d.$$"); _v=$(cat "$DIR/p.v.$$")
+        rm -f "$DIR/p.d.$$" "$DIR/p.v.$$"
     else
         # без имени блокировку по SNI не воспроизвести: проверяем одинаково
         # оба пути по адресу, и вывод получается осторожным
@@ -610,6 +617,7 @@ scan() {
     [ -s "$DIR/verdicts" ] || { [ -s "$STATE" ] && cp -f "$STATE" "$DIR/verdicts"; }
     forget_stale_verdicts
     expire_ips
+    expire_bridge
     publish_lists   # ссылки нужны и для ручного подключения в Forkozz
     heal_hook
     sync_live
@@ -670,7 +678,11 @@ scan() {
         # никогда — на домашнем роутере перепроверка так и не запустилась.
         # Поэтому первый шаг захода отдаём перепроверке списка, второй — одному
         # имени обхода, а кандидаты берут то, что осталось.
-        [ "$tick" = 1 ] && recheck_listed
+        # Но пока есть недоподтверждённая находка, первый шаг нужен ей: от
+        # второй проверки зависит, когда сайт пойдёт в туннель.
+        if [ "$tick" = 1 ]; then
+            [ -n "$(redo_list | head -1)" ] || recheck_listed
+        fi
         [ "$tick" = 2 ] && sweep 1
 
         # Недоподтверждённое доводим до конца — раньше новых кандидатов: это
@@ -831,10 +843,10 @@ LISTED=$STATE_DIR/listed
 
 listed_due() {   # домены из списка, которым пора на перепроверку, давние первыми
     touch "$LISTED" "$DOMAINS_FILE" 2>/dev/null
-    awk -F'|' -v now="$now" -v rc="$RECHECK_LISTED" -v lf="$LISTED" '
+    awk -F'|' -v now="$now" -v rc="$RECHECK_LISTED" -v ok="$RECHECK_OK" -v lf="$LISTED" '
         FILENAME == lf { last[$1] = $2; st[$1] = $3; next }
         /^[[:space:]]*(#|$)/ { next }
-        { d = $1; iv = (st[d] > 0 && rc > 86400) ? 86400 : rc
+        { d = $1; iv = (st[d] > 0 && rc > ok) ? ok : rc
           if (!(d in last) || now - last[d] >= iv) print ((d in last) ? last[d] : 0), d }' \
         "$LISTED" "$DOMAINS_FILE" | sort -n | cut -d' ' -f2
 }
@@ -1139,6 +1151,7 @@ drop_ip() {   # адрес — убрать отовсюду
         fi
     fi
     nft delete element inet "$NFT_TABLE" "$NFT_SET" "{ $_a }" 2>/dev/null
+    [ -s "$DIR/bridge" ] && { grep -vF "$_a|" "$DIR/bridge" > "$DIR/bridge.tmp"; mv "$DIR/bridge.tmp" "$DIR/bridge"; }
     # и вердикты: вернётся блокировка — найдём заново, а не будем ждать 6 часов
     awk -F'|' -v a="$_a" '$1 != a' "$DIR/verdicts" > "$DIR/v.tmp" 2>/dev/null && mv "$DIR/v.tmp" "$DIR/verdicts"
 }
@@ -1288,6 +1301,41 @@ inject_live() {   # домены через перевод строки
     return 1
 }
 
+# Мост по адресам. Клиент мог закэшировать настоящий адрес сайта и ходит на него
+# напрямую, пока не истечёт его DNS-кэш (минуты). Пока домен не вошёл в fakeip,
+# отправляем адреса сайта в sing-box через nft-множество бэкенда: первое правило
+# sing-box — sniff, и по SNI в туннель уйдёт только добавленный домен, соседние
+# сайты того же CDN пойдут напрямую. Адреса живут BRIDGE_TTL и лежат в ОЗУ;
+# навсегда в туннель идут только адреса из $SUBNETS_FILE.
+BRIDGE_TTL=1800
+BRIDGE_MAX=8       # адресов на домен
+bridge_add() {   # домены через перевод строки
+    [ -n "$NFT_TABLE" ] && [ -n "$NFT_SET" ] || return 0
+    touch "$DIR/bridge"
+    for _bd in $1; do
+        grep -F " $_bd" "$DIR/ipmap" 2>/dev/null | awk -v d="$_bd" '$2 == d { print $1 }' |
+            awk '!s[$0]++' | tail -"$BRIDGE_MAX" |
+            while read -r _ba; do
+                case "$_ba" in 0.*|10.*|127.*|169.254.*|192.168.*|224.*|240.*) continue ;; esac
+                in_nets "$_ba" 172.16.0.0/12 100.64.0.0/10 "$FAKEIP_RANGE" && continue
+                in_backend_set "$_ba" && continue
+                nft add element inet "$NFT_TABLE" "$NFT_SET" "{ $_ba }" 2>/dev/null &&
+                    echo "$_ba|$((now + BRIDGE_TTL))" >> "$DIR/bridge"
+            done
+    done
+}
+
+expire_bridge() {   # снять просроченные адреса; постоянные (SUBNETS_FILE) не трогаем
+    [ -s "$DIR/bridge" ] || return 0
+    awk -F'|' -v now="$now" '$2 + 0 <= now { print $1 }' "$DIR/bridge" |
+        while read -r _ba; do
+            grep -qxF "$_ba" "$SUBNETS_FILE" 2>/dev/null ||
+                nft delete element inet "$NFT_TABLE" "$NFT_SET" "{ $_ba }" 2>/dev/null
+        done
+    awk -F'|' -v now="$now" '$2 + 0 > now' "$DIR/bridge" > "$DIR/bridge.tmp" 2>/dev/null &&
+        mv "$DIR/bridge.tmp" "$DIR/bridge"
+}
+
 export_domains() {   # [auto]
     mkdir -p "$(dirname "$DOMAINS_FILE")" "$STATE_DIR"; touch "$DOMAINS_FILE"
     _today=$(grep -c "^$(date '+%Y-%m-%d') .*ДОБАВЛЕН" "$LOG" 2>/dev/null); _today=${_today:-0}
@@ -1328,6 +1376,7 @@ export_domains() {   # [auto]
             _msg="записано в файл; $BACKEND собрал sing-box без этого списка — перезапусти $BACKEND"
         elif inject_live "$_add"; then
             _ok=true; _mode=live; _msg="применено на лету, соединения не рвались"
+            bridge_add "$_add"
         elif [ "$1" = auto ]; then
             # автоматика бэкенд не перезапускает никогда: домен уже в файле и
             # применится при ближайшем его перезапуске
@@ -1635,6 +1684,7 @@ setup_system() {
 
 restore_system() {
     cron_off
+    now=99999999999; expire_bridge   # снять весь мост
     if [ -f "$SAVED" ]; then
         log_size=""; logqueries=""; acct=""
         # shellcheck disable=SC1090  # файл пишет setup_system

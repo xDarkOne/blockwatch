@@ -234,7 +234,7 @@ function recheckBadge(st, a) {
 function domainsTab(state, st) {
 	var added = st.added || [];
 	return [
-		E('p', { 'class': 'bw-muted' }, 'Перепроверка раз в ' + ((st.recheck && st.recheck.hours) || 72) +
+		E('p', { 'class': 'bw-muted' }, 'Перепроверка раз в ' + ((st.recheck && st.recheck.hours) || 24) +
 			' ч; открылся напрямую ' + ((st.recheck && st.recheck.remove_after) || 3) + ' раза подряд — уберётся сам.'),
 		pagedTable(state, 'domains', added, function (a) { return a.domain; },
 			['Сайт', 'Добавлен', 'Сейчас', 'Перепроверка', ''],
@@ -340,7 +340,7 @@ function settingsMap() {
 	o = s.taboption('find', form.Value, 'confirm_minutes', 'Второе подтверждение через, минут',
 		'Находка добавляется после двух совпадений в разных проверках — так отсекается разовый сбой. ' +
 		'Если сайт снова открывали, вторая проверка идёт через минуту.');
-	o.datatype = 'range(2,120)'; o.placeholder = '5';
+	o.datatype = 'range(1,120)'; o.placeholder = '1';
 	o = s.taboption('find', form.Value, 'max_per_day', 'Не больше в сутки',
 		'Доменов и адресов вместе. Страховка от лавины ложных находок.');
 	o.datatype = 'range(1,200)'; o.placeholder = '30';
@@ -356,8 +356,8 @@ function settingsMap() {
 	o = s.taboption('list', form.Flag, 'auto_remove', 'Убирать домены, которые снова открываются напрямую');
 	o.default = '1'; o.rmempty = false;
 	o = s.taboption('list', form.Value, 'recheck_hours', 'Перепроверять домены раз в, часов',
-		'Каждый домен открывается напрямую, мимо туннеля. После удачной проверки следующая — через сутки.');
-	o.datatype = 'range(1,720)'; o.placeholder = '72';
+		'Каждый домен открывается напрямую, мимо туннеля. После удачной проверки следующая — через 6 часов.');
+	o.datatype = 'range(1,720)'; o.placeholder = '24';
 	o = s.taboption('list', form.Value, 'remove_after', 'Убирать после удачных проверок подряд',
 		'Блокировки то включают, то снимают — одной удачи мало.');
 	o.datatype = 'range(1,10)'; o.placeholder = '3';
